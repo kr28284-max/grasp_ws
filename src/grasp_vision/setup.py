@@ -1,0 +1,41 @@
+import os
+from glob import glob
+
+from setuptools import find_packages, setup
+
+package_name = 'grasp_vision'
+
+setup(
+    name=package_name,
+    version='0.0.0',
+    packages=find_packages(exclude=['test']),
+    data_files=[
+        ('share/ament_index/resource_index/packages',
+            ['resource/' + package_name]),
+        ('share/' + package_name, ['package.xml']),
+        (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
+        (os.path.join('share', package_name, 'rviz'), glob('rviz/*.rviz')),
+    ],
+    install_requires=['setuptools'],
+    options={
+        'build_py': {'force': True},
+        'install': {'force': True},
+        'install_lib': {'force': True},
+    },
+    zip_safe=True,
+    maintainer='user',
+    maintainer_email='jeho4557@gmail.com',
+    description='TODO: Package description',
+    license='TODO: License declaration',
+    extras_require={
+        'test': [
+            'pytest',
+        ],
+    },
+    entry_points={
+        'console_scripts': [
+            'yolo_seg_node = grasp_vision.yolo_seg_node:main',
+            'pose_estimation_node = grasp_vision.pose_estimation_node:main',
+        ],
+    },
+)
