@@ -66,6 +66,7 @@ class GraspControlNode(Node):
         self.latest_camera_pose: Optional[PoseStamped] = None
         self.latest_base_pose: Optional[PoseStamped] = None
         self.latest_object_base_pose: Optional[PoseStamped] = None
+        self.object_pose_history = deque(maxlen=20)
         self.latest_table_plane: Optional[TablePlane] = None
         self.stable_base_pose: Optional[PoseStamped] = None
         self.stable_pose_time = 0.0
@@ -234,10 +235,19 @@ class GraspControlNode(Node):
         self.declare_parameter('tf_timeout_sec', 0.2)
         self.declare_parameter('stable_sample_count', 5)
         self.declare_parameter('max_position_stddev_m', 0.005)
+        self.declare_parameter('max_orientation_deviation_deg', 3.0)
         self.declare_parameter('workspace_min_xyz_m', [0.05, -0.30, 0.01])
         self.declare_parameter('workspace_max_xyz_m', [0.45, 0.30, 0.45])
         self.declare_parameter('return_home_on_error', True)
         self.declare_parameter('max_orientation_residual_deg', 20.0)
+        self.declare_parameter(
+            'grasp_tilt_candidates_deg', [0.0, 15.0, 30.0, 45.0, 60.0]
+        )
+        self.declare_parameter('tilted_orientation_tolerance_deg', 15.0)
+        self.declare_parameter('max_grasp_tilt_deg', 70.0)
+        self.declare_parameter('max_closing_axis_error_deg', 20.0)
+        self.declare_parameter('min_ee_table_clearance_m', 0.015)
+        self.declare_parameter('arm_base_xy_m', [-0.080, 0.0])
 
     def _read_parameters(self) -> None:
         def value(name: str):
@@ -279,12 +289,34 @@ class GraspControlNode(Node):
         self.tf_timeout = float(value('tf_timeout_sec'))
         self.stable_sample_count = int(value('stable_sample_count'))
         self.max_position_stddev = float(value('max_position_stddev_m'))
+        self.max_orientation_deviation = math.radians(
+            float(value('max_orientation_deviation_deg'))
+        )
         self.workspace_min = self._xyz(value('workspace_min_xyz_m'))
         self.workspace_max = self._xyz(value('workspace_max_xyz_m'))
         self.return_home_on_error = bool(value('return_home_on_error'))
         self.max_orientation_residual = math.radians(
             float(value('max_orientation_residual_deg'))
         )
+        self.grasp_tilt_candidates = sorted({
+            float(angle) for angle in value('grasp_tilt_candidates_deg')
+        })
+        self.tilted_orientation_tolerance = math.radians(
+            float(value('tilted_orientation_tolerance_deg'))
+        )
+        self.max_grasp_tilt = math.radians(
+            float(value('max_grasp_tilt_deg'))
+        )
+        self.max_closing_axis_error = math.radians(
+            float(value('max_closing_axis_error_deg'))
+        )
+        self.min_ee_table_clearance = float(
+            value('min_ee_table_clearance_m')
+        )
+        arm_base_xy = value('arm_base_xy_m')
+        if len(arm_base_xy) != 2:
+            raise ValueError('arm_base_xy_m must contain two values')
+        self.arm_base_xy = np.asarray(arm_base_xy, dtype=np.float64)
 
         if self.stable_sample_count < 1:
             raise ValueError('stable_sample_count must be positive')
@@ -305,6 +337,12 @@ class GraspControlNode(Node):
             raise ValueError('moveit_velocity_scale must be in (0, 1]')
         if not 0.0 < self.acceleration_scale <= 1.0:
             raise ValueError('moveit_acceleration_scale must be in (0, 1]')
+        if not self.grasp_tilt_candidates or self.grasp_tilt_candidates[0] != 0.0:
+            raise ValueError('grasp_tilt_candidates_deg must start at zero')
+        if self.grasp_tilt_candidates[-1] > math.degrees(self.max_grasp_tilt):
+            raise ValueError(
+                'grasp tilt candidates must not exceed max_grasp_tilt_deg'
+            )
 
     @staticmethod
     def _degrees_pose(values: Sequence[float]) -> list[float]:
@@ -387,6 +425,7 @@ class GraspControlNode(Node):
             base_pose.header.frame_id = self.base_frame
             with self.state_lock:
                 self.latest_object_base_pose = base_pose
+                self.object_pose_history.append(base_pose)
             self.base_object_pose_pub.publish(base_pose)
         except TransformException as exc:
             self.get_logger().warn(
@@ -406,25 +445,47 @@ class GraspControlNode(Node):
             pose.pose.position.y,
             pose.pose.position.z,
         ])
-        if not np.isfinite(point).all():
+        quaternion = np.array([
+            pose.pose.orientation.x,
+            pose.pose.orientation.y,
+            pose.pose.orientation.z,
+            pose.pose.orientation.w,
+        ])
+        quaternion_norm = float(np.linalg.norm(quaternion))
+        if not np.isfinite(point).all() or quaternion_norm < 1e-9:
             return
+        quaternion /= quaternion_norm
 
         with self.pose_condition:
             self.latest_base_pose = pose
-            self.pose_samples.append(point)
+            self.pose_samples.append((point, quaternion))
             if len(self.pose_samples) < self.stable_sample_count:
                 return
-            samples = np.asarray(self.pose_samples)
-            if float(np.max(np.std(samples, axis=0))) > self.max_position_stddev:
+            position_samples = np.asarray([
+                sample[0] for sample in self.pose_samples
+            ])
+            if (
+                float(np.max(np.std(position_samples, axis=0)))
+                > self.max_position_stddev
+            ):
+                return
+            orientation, max_deviation = self._average_quaternions([
+                sample[1] for sample in self.pose_samples
+            ])
+            if max_deviation > self.max_orientation_deviation:
                 return
 
-            median = np.median(samples, axis=0)
+            median = np.median(position_samples, axis=0)
             stable = PoseStamped()
             stable.header = pose.header
             stable.pose = copy.deepcopy(pose.pose)
             stable.pose.position.x = float(median[0])
             stable.pose.position.y = float(median[1])
             stable.pose.position.z = float(median[2])
+            stable.pose.orientation.x = float(orientation[0])
+            stable.pose.orientation.y = float(orientation[1])
+            stable.pose.orientation.z = float(orientation[2])
+            stable.pose.orientation.w = float(orientation[3])
             self.stable_base_pose = stable
             self.stable_pose_time = time.monotonic()
             self.pose_condition.notify_all()
@@ -439,6 +500,7 @@ class GraspControlNode(Node):
         self.stable_base_pose = None
         self.stable_pose_time = 0.0
         self.latest_object_base_pose = None
+        self.object_pose_history.clear()
         self.pose_samples.clear()
 
     def prepare_cb(self, msg: Bool) -> None:
@@ -473,7 +535,9 @@ class GraspControlNode(Node):
                 return
             self.interrupt_mode = None
             self.is_busy = True
-            object_pose = copy.deepcopy(self.latest_object_base_pose)
+            object_pose = copy.deepcopy(
+                self._matching_object_pose_locked(desired_pose)
+            )
             table_plane = copy.deepcopy(self.latest_table_plane)
         threading.Thread(
             target=self._execute_candidate,
@@ -481,6 +545,23 @@ class GraspControlNode(Node):
             name='openmanipulator-execution',
             daemon=True,
         ).start()
+
+    def _matching_object_pose_locked(
+        self, desired_pose: PoseStamped
+    ) -> Optional[PoseStamped]:
+        """Return the object pose captured with the selected grasp pose."""
+        target_stamp = (
+            desired_pose.header.stamp.sec,
+            desired_pose.header.stamp.nanosec,
+        )
+        for candidate in reversed(self.object_pose_history):
+            candidate_stamp = (
+                candidate.header.stamp.sec,
+                candidate.header.stamp.nanosec,
+            )
+            if candidate_stamp == target_stamp:
+                return candidate
+        return self.latest_object_base_pose
 
     def home_cb(self, msg: Bool) -> None:
         if not msg.data:
@@ -597,75 +678,117 @@ class GraspControlNode(Node):
         orientation_residual = math.inf
         try:
             self._log_object_pose_once(object_pose, table_plane)
-            candidates = self._vision_grasp_to_ee_candidates(
-                desired_pose.pose.orientation
+            if table_plane is None:
+                raise ValueError('stable table plane is unavailable')
+            base_pick = self._offset_pose(
+                desired_pose, self.pick_calibration
+            )
+            self._validate_workspace(base_pick)
+            base_pregrasp = self._offset_pose(
+                base_pick, self.pregrasp_offset
+            )
+            self._validate_workspace(base_pregrasp)
+            orientation_levels = self._tilted_ee_orientation_levels(
+                desired_pose.pose.orientation,
+                base_pregrasp.pose.position,
+                self.arm_base_xy,
+                self.grasp_tilt_candidates,
             )
             valid_plans = []
-            for index, orientation in enumerate(candidates, start=1):
-                candidate_pick = self._pose_with_orientation(
-                    desired_pose, orientation
-                )
-                candidate_pick = self._offset_pose(
-                    candidate_pick, self.pick_calibration
-                )
-                self._validate_workspace(candidate_pick)
-                candidate_pregrasp = self._offset_pose(
-                    candidate_pick, self.pregrasp_offset
-                )
-                self._validate_workspace(candidate_pregrasp)
+            attempted_candidates = 0
+            for target_tilt, candidates in orientation_levels:
                 self.publish_status(
-                    f'CHECK: Planning PRE-GRASP candidate {index}/2 '
-                    'without execution'
+                    'CHECK: Searching PRE-GRASP at '
+                    f'{target_tilt:.0f} deg tilt from vertical'
                 )
-                plan = self._move_group_pose(
-                    candidate_pregrasp,
-                    f'PRE-GRASP CANDIDATE {index}',
-                    plan_only=True,
-                )
-                if plan is None:
-                    continue
-                planned_pose = self._planned_command_pose(plan)
-                residual = self._orientation_error(
-                    orientation, planned_pose.pose.orientation
-                )
-                self.get_logger().info(
-                    f'PRE-GRASP candidate {index} FK orientation residual: '
-                    f'{math.degrees(residual):.1f} deg'
-                )
-                if residual <= self.max_orientation_residual:
-                    valid_plans.append((
+                level_plans = []
+                for label, orientation in candidates:
+                    attempted_candidates += 1
+                    candidate_pick = self._pose_with_orientation(
+                        base_pick, orientation
+                    )
+                    candidate_pregrasp = self._pose_with_orientation(
+                        base_pregrasp, orientation
+                    )
+                    plan = self._move_group_pose(
+                        candidate_pregrasp,
+                        f'PRE-GRASP {label}',
+                        plan_only=True,
+                        orientation_tolerance=(
+                            self.tilted_orientation_tolerance
+                        ),
+                    )
+                    if plan is None:
+                        continue
+                    planned_pose = self._planned_command_pose(plan)
+                    residual = self._orientation_error(
+                        orientation, planned_pose.pose.orientation
+                    )
+                    if residual > self.max_orientation_residual:
+                        self.get_logger().warn(
+                            f'PRE-GRASP {label} rejected: FK residual '
+                            f'{math.degrees(residual):.1f} deg exceeds '
+                            f'{math.degrees(self.max_orientation_residual):.1f} '
+                            'deg'
+                        )
+                        continue
+                    command_pick = self._pose_with_orientation(
+                        candidate_pick, planned_pose.pose.orientation
+                    )
+                    try:
+                        actual_tilt, closing_error = (
+                            self._validate_grasp_geometry(
+                                planned_pose,
+                                command_pick,
+                                orientation,
+                                table_plane,
+                            )
+                        )
+                    except ValueError as exc:
+                        self.get_logger().warn(
+                            f'PRE-GRASP {label} rejected: {exc}'
+                        )
+                        continue
+                    self.get_logger().info(
+                        f'PRE-GRASP {label}: target tilt='
+                        f'{target_tilt:.1f} deg, actual tilt='
+                        f'{math.degrees(actual_tilt):.1f} deg, '
+                        f'closing-axis error='
+                        f'{math.degrees(closing_error):.1f} deg, '
+                        f'FK residual={math.degrees(residual):.1f} deg'
+                    )
+                    level_plans.append((
+                        actual_tilt,
                         residual,
-                        index,
+                        label,
                         plan,
                         planned_pose,
-                        candidate_pick,
+                        command_pick,
                         orientation,
                     ))
-                else:
-                    self.get_logger().warn(
-                        f'PRE-GRASP candidate {index} rejected: FK residual '
-                        f'{math.degrees(residual):.1f} deg exceeds '
-                        f'{math.degrees(self.max_orientation_residual):.1f} deg'
-                    )
+                if level_plans:
+                    valid_plans = level_plans
+                    break
 
             if not valid_plans:
                 raise ValueError(
-                    'no PRE-GRASP orientation candidate passed planning and '
-                    f'the {math.degrees(self.max_orientation_residual):.1f} deg '
-                    'FK residual limit'
+                    'no vertical or tilted PRE-GRASP candidate passed '
+                    f'{attempted_candidates} planning and safety checks'
                 )
 
             (
+                selected_tilt,
                 orientation_residual,
-                selected_index,
+                selected_label,
                 pregrasp_plan,
                 pregrasp_command_pose,
                 pick,
                 selected_orientation,
-            ) = min(valid_plans, key=lambda candidate: candidate[0])
+            ) = min(valid_plans, key=lambda candidate: (candidate[0], candidate[1]))
             self.publish_status(
-                f'CHECK: Selected PRE-GRASP candidate {selected_index} '
-                f'(FK residual={math.degrees(orientation_residual):.1f} deg)'
+                f'CHECK: Selected PRE-GRASP {selected_label}, '
+                f'tilt={math.degrees(selected_tilt):.1f} deg, '
+                f'FK residual={math.degrees(orientation_residual):.1f} deg'
             )
             self.publish_status(
                 'CHECK: Planning Cartesian PICK approach without execution'
@@ -840,6 +963,22 @@ class GraspControlNode(Node):
         )
         return roll, pitch, yaw
 
+    @staticmethod
+    def _average_quaternions(samples):
+        """Average sign-equivalent XYZW quaternions and report max error."""
+        quaternions = np.asarray(samples, dtype=np.float64)
+        reference = quaternions[0]
+        aligned = quaternions.copy()
+        aligned[(aligned @ reference) < 0.0] *= -1.0
+        average = np.mean(aligned, axis=0)
+        average_norm = float(np.linalg.norm(average))
+        if average_norm < 1e-9:
+            return reference, math.inf
+        average /= average_norm
+        dots = np.clip(np.abs(aligned @ average), -1.0, 1.0)
+        deviations = 2.0 * np.arccos(dots)
+        return average, float(np.max(deviations))
+
     def _log_object_pose_once(
         self,
         object_pose: Optional[PoseStamped],
@@ -930,6 +1069,142 @@ class GraspControlNode(Node):
             converted, Quaternion(x=1.0, y=0.0, z=0.0, w=0.0)
         )
         return converted, flipped
+
+    @staticmethod
+    def _quaternion_axes(quaternion) -> np.ndarray:
+        """Return rotation columns for an XYZW geometry quaternion."""
+        x, y, z, w = np.asarray([
+            quaternion.x,
+            quaternion.y,
+            quaternion.z,
+            quaternion.w,
+        ], dtype=np.float64)
+        norm = math.sqrt(x * x + y * y + z * z + w * w)
+        if norm < 1e-9:
+            raise ValueError('orientation quaternion must not be zero')
+        x, y, z, w = x / norm, y / norm, z / norm, w / norm
+        return np.array([
+            [1.0 - 2.0 * (y * y + z * z),
+             2.0 * (x * y - z * w),
+             2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w),
+             1.0 - 2.0 * (x * x + z * z),
+             2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w),
+             2.0 * (y * z + x * w),
+             1.0 - 2.0 * (x * x + y * y)],
+        ])
+
+    @classmethod
+    def _tilted_ee_orientation_levels(
+        cls,
+        grasp,
+        target_position,
+        arm_base_xy,
+        tilt_angles,
+    ):
+        """Generate increasingly tilted poses while preserving finger axis."""
+        vertical_candidates = cls._vision_grasp_to_ee_candidates(grasp)
+        radial = np.array([
+            target_position.x - float(arm_base_xy[0]),
+            target_position.y - float(arm_base_xy[1]),
+        ])
+        radial_norm = float(np.linalg.norm(radial))
+        if radial_norm > 1e-9:
+            radial /= radial_norm
+
+        levels = []
+        for tilt_degrees in tilt_angles:
+            level = []
+            for symmetry, vertical in enumerate(vertical_candidates, start=1):
+                if abs(tilt_degrees) < 1e-9:
+                    orientation = vertical
+                else:
+                    alternatives = []
+                    for sign in (-1.0, 1.0):
+                        half_angle = math.radians(
+                            sign * tilt_degrees
+                        ) * 0.5
+                        local_tilt = Quaternion(
+                            x=0.0,
+                            y=math.sin(half_angle),
+                            z=0.0,
+                            w=math.cos(half_angle),
+                        )
+                        tilted = cls._quaternion_product(
+                            vertical, local_tilt
+                        )
+                        approach_xy = cls._quaternion_axes(tilted)[:2, 0]
+                        score = float(np.dot(approach_xy, radial))
+                        alternatives.append((score, tilted))
+                    orientation = max(
+                        alternatives, key=lambda item: item[0]
+                    )[1]
+                level.append((
+                    f'TILT {tilt_degrees:.0f} SYMMETRY {symmetry}',
+                    orientation,
+                ))
+            levels.append((float(tilt_degrees), level))
+        return levels
+
+    def _validate_grasp_geometry(
+        self,
+        planned_pregrasp: PoseStamped,
+        pick: PoseStamped,
+        target_orientation,
+        table_plane: TablePlane,
+    ):
+        """Check downward approach, finger alignment, and table clearance."""
+        normal = np.array([
+            table_plane.normal.x,
+            table_plane.normal.y,
+            table_plane.normal.z,
+        ], dtype=np.float64)
+        normal_norm = float(np.linalg.norm(normal))
+        if normal_norm < 1e-9:
+            raise ValueError('table normal is invalid')
+        normal /= normal_norm
+        if normal[2] < 0.0:
+            normal = -normal
+
+        actual_axes = self._quaternion_axes(
+            planned_pregrasp.pose.orientation
+        )
+        target_axes = self._quaternion_axes(target_orientation)
+        approach_dot = float(np.clip(
+            np.dot(actual_axes[:, 0], -normal), -1.0, 1.0
+        ))
+        actual_tilt = math.acos(approach_dot)
+        if actual_tilt > self.max_grasp_tilt:
+            raise ValueError(
+                f'approach tilt {math.degrees(actual_tilt):.1f} deg exceeds '
+                f'{math.degrees(self.max_grasp_tilt):.1f} deg'
+            )
+
+        closing_dot = abs(float(np.clip(
+            np.dot(actual_axes[:, 1], target_axes[:, 1]), -1.0, 1.0
+        )))
+        closing_error = math.acos(closing_dot)
+        if closing_error > self.max_closing_axis_error:
+            raise ValueError(
+                'finger closing-axis error '
+                f'{math.degrees(closing_error):.1f} deg exceeds '
+                f'{math.degrees(self.max_closing_axis_error):.1f} deg'
+            )
+
+        pick_point = np.array([
+            pick.pose.position.x,
+            pick.pose.position.y,
+            pick.pose.position.z,
+        ])
+        plane_offset = -float(table_plane.height) * normal[2]
+        clearance = float(np.dot(normal, pick_point) + plane_offset)
+        if clearance < self.min_ee_table_clearance:
+            raise ValueError(
+                f'EE table clearance {clearance:.3f} m is below '
+                f'{self.min_ee_table_clearance:.3f} m'
+            )
+        return actual_tilt, closing_error
 
     def _publish_result(
         self,
@@ -1058,6 +1333,7 @@ class GraspControlNode(Node):
         label: str,
         *,
         plan_only: bool,
+        orientation_tolerance: Optional[float] = None,
     ):
         self._wait_action_server(self.move_group_client, 'MoveIt')
         goal = MoveGroup.Goal()
@@ -1075,7 +1351,11 @@ class GraspControlNode(Node):
             self.base_frame,
             self.end_effector_link,
             self.position_tolerance,
-            self.max_orientation_residual,
+            (
+                self.max_orientation_residual
+                if orientation_tolerance is None
+                else orientation_tolerance
+            ),
         )
         goal.request.goal_constraints.append(constraints)
 

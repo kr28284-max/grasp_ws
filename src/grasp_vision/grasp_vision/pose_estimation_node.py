@@ -1,13 +1,20 @@
 import math
 import numpy as np
 
+import message_filters
 import rclpy
+from rclpy.duration import Duration
 from rclpy.node import Node
+from rclpy.time import Time
 from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import String, Header
 from geometry_msgs.msg import PoseStamped, TransformStamped
+from grasp_interfaces.msg import TablePlane
 from visualization_msgs.msg import Marker, MarkerArray
 import tf2_ros
+
+from grasp_vision.duplo_geometry import estimate_duplo_table_pose
+from grasp_vision.table_geometry import transform_points
 
 
 def rotation_matrix_to_quaternion(R: np.ndarray) -> np.ndarray:
@@ -50,6 +57,22 @@ class PoseEstimationNode(Node):
         # 1. 파라미터 선언
         self.declare_parameter('min_points', 30)
         self.min_points = self.get_parameter('min_points').value
+        self.declare_parameter('base_frame', 'base_link')
+        self.declare_parameter('table_sync_slop_sec', 0.05)
+        self.declare_parameter('tf_timeout_sec', 0.15)
+        self.declare_parameter('duplo_height_tolerance', 0.012)
+        self.declare_parameter('duplo_height_ambiguity_margin', 0.002)
+        self.base_frame = str(self.get_parameter('base_frame').value)
+        self.table_sync_slop = float(
+            self.get_parameter('table_sync_slop_sec').value
+        )
+        self.tf_timeout = float(self.get_parameter('tf_timeout_sec').value)
+        self.duplo_height_tolerance = float(
+            self.get_parameter('duplo_height_tolerance').value
+        )
+        self.duplo_height_ambiguity_margin = float(
+            self.get_parameter('duplo_height_ambiguity_margin').value
+        )
 
         # 실측 치수 (미터 단위)
         # 4x2 듀플로 블록: 긴변 6.31cm, 짧은변 3.1cm, 높이 2.31cm(스터드포함) / 1.9cm, 중심높이 1.15cm
@@ -81,12 +104,22 @@ class PoseEstimationNode(Node):
             self.class_cb,
             10
         )
-        self.create_subscription(
+        cloud_sub = message_filters.Subscriber(
+            self,
             PointCloud2,
-            '/grasp/target_cloud_filtered',
-            self.cloud_cb,
-            10
+            '/grasp/target_cloud_filtered'
         )
+        table_sub = message_filters.Subscriber(
+            self,
+            TablePlane,
+            '/grasp/table_plane'
+        )
+        self.table_sync = message_filters.ApproximateTimeSynchronizer(
+            [cloud_sub, table_sub],
+            queue_size=10,
+            slop=self.table_sync_slop
+        )
+        self.table_sync.registerCallback(self.cloud_cb)
 
         # 3. 퍼블리셔
         self.object_pose_pub = self.create_publisher(
@@ -106,6 +139,8 @@ class PoseEstimationNode(Node):
         )
 
         # 4. TF 브로드캐스터
+        self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=5.0))
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
 
         self.get_logger().info('Pose Estimation & Grasp Node Started.')
@@ -113,7 +148,7 @@ class PoseEstimationNode(Node):
     def class_cb(self, msg: String):
         self.current_class = msg.data.strip().lower()
 
-    def cloud_cb(self, msg: PointCloud2):
+    def cloud_cb(self, msg: PointCloud2, table_plane: TablePlane):
         points = self.unpack_pointcloud2(msg)
 
         if len(points) < self.min_points or not self.current_class:
@@ -130,29 +165,119 @@ class PoseEstimationNode(Node):
             self.clear_markers(msg.header)
             return
 
-        # 2) PCA 주성분 분석 기반 6D Pose 추정
-        obj_pose, grasp_pose, box_dims = self.estimate_pose(
-            filtered_points,
-            self.current_class
-        )
+        output_header = msg.header
+        if 'duplo' in self.current_class:
+            base_points = self.points_to_base(filtered_points, msg)
+            if base_points is None:
+                self.clear_markers(msg.header)
+                return
+            result = self.process_duplo_with_table(base_points, table_plane)
+            if result is None:
+                self.clear_markers(msg.header)
+                return
+            obj_pose, grasp_pose, box_dims = result
+            output_header = Header()
+            output_header.stamp = msg.header.stamp
+            output_header.frame_id = self.base_frame
+        else:
+            # Preserve the existing PCA path for non-Duplo classes.
+            obj_pose, grasp_pose, box_dims = self.estimate_pose(
+                filtered_points,
+                self.current_class
+            )
 
         if obj_pose is None:
             self.clear_markers(msg.header)
             return
 
         # 3) ROS PoseStamped 생성 및 퍼블리시
-        obj_msg = self.create_pose_stamped(msg.header, obj_pose[0], obj_pose[1])
-        grasp_msg = self.create_pose_stamped(msg.header, grasp_pose[0], grasp_pose[1])
+        obj_msg = self.create_pose_stamped(
+            output_header, obj_pose[0], obj_pose[1]
+        )
+        grasp_msg = self.create_pose_stamped(
+            output_header, grasp_pose[0], grasp_pose[1]
+        )
 
         self.object_pose_pub.publish(obj_msg)
         self.grasp_pose_pub.publish(grasp_msg)
 
         # 4) TF 브로드캐스트 (object_frame & grasp_frame)
-        self.broadcast_tf(msg.header, 'object_frame', obj_pose[0], obj_pose[1])
-        self.broadcast_tf(msg.header, 'grasp_frame', grasp_pose[0], grasp_pose[1])
+        self.broadcast_tf(
+            output_header, 'object_frame', obj_pose[0], obj_pose[1]
+        )
+        self.broadcast_tf(
+            output_header, 'grasp_frame', grasp_pose[0], grasp_pose[1]
+        )
 
         # 5) RViz 시각화 마커 발행
-        self.publish_markers(msg.header, obj_pose, grasp_pose, box_dims)
+        self.publish_markers(
+            output_header, obj_pose, grasp_pose, box_dims
+        )
+
+    def points_to_base(self, points: np.ndarray, msg: PointCloud2):
+        """Transform a timestamped camera cloud to the planning frame."""
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.base_frame,
+                msg.header.frame_id,
+                Time.from_msg(msg.header.stamp),
+                timeout=Duration(seconds=self.tf_timeout)
+            )
+        except tf2_ros.TransformException as exc:
+            self.get_logger().warn(
+                f'Duplo cloud TF unavailable: {exc}',
+                throttle_duration_sec=2.0
+            )
+            return None
+        translation = np.array([
+            transform.transform.translation.x,
+            transform.transform.translation.y,
+            transform.transform.translation.z,
+        ])
+        quaternion = np.array([
+            transform.transform.rotation.x,
+            transform.transform.rotation.y,
+            transform.transform.rotation.z,
+            transform.transform.rotation.w,
+        ])
+        return transform_points(points, translation, quaternion)
+
+    def process_duplo_with_table(
+        self,
+        points_base: np.ndarray,
+        table_plane: TablePlane
+    ):
+        """Create a fixed-model Duplo pose referenced to the table plane."""
+        normal = np.array([
+            table_plane.normal.x,
+            table_plane.normal.y,
+            table_plane.normal.z,
+        ])
+        model_dims = self.duplo_dims[:3]
+        result = estimate_duplo_table_pose(
+            points_base,
+            normal,
+            table_plane.height,
+            model_dims,
+            self.duplo_height_tolerance,
+            self.duplo_height_ambiguity_margin
+        )
+        if result is None:
+            self.get_logger().warn(
+                'Duplo placement is ambiguous: visible height does not match '
+                '23.1, 31.0, or 63.1 mm.',
+                throttle_duration_sec=2.0
+            )
+            return None
+        obj_pose = (
+            result.center,
+            rotation_matrix_to_quaternion(result.rotation)
+        )
+        grasp_pose = (
+            result.grasp_center,
+            rotation_matrix_to_quaternion(result.grasp_rotation)
+        )
+        return obj_pose, grasp_pose, tuple(model_dims)
 
     def unpack_pointcloud2(self, cloud_msg: PointCloud2) -> np.ndarray:
         if cloud_msg.width * cloud_msg.height == 0:

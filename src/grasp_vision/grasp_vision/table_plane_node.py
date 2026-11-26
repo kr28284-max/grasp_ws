@@ -35,6 +35,7 @@ class TablePlaneNode(Node):
         self.declare_parameter('stability_window', 8)
         self.declare_parameter('min_stable_samples', 5)
         self.declare_parameter('max_normal_deviation_deg', 3.0)
+        self.declare_parameter('max_table_tilt_deg', 5.0)
         self.declare_parameter('max_height_std', 0.008)
         self.declare_parameter('marker_size', 0.40)
 
@@ -57,11 +58,15 @@ class TablePlaneNode(Node):
         self.max_normal_deviation = math.radians(float(
             self.get_parameter('max_normal_deviation_deg').value
         ))
+        self.max_table_tilt = math.radians(float(
+            self.get_parameter('max_table_tilt_deg').value
+        ))
         self.max_height_std = float(
             self.get_parameter('max_height_std').value
         )
         self.marker_size = float(self.get_parameter('marker_size').value)
         self.samples = deque(maxlen=window)
+        self.table_tilt_rejected = False
         self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=5.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
@@ -168,7 +173,20 @@ class TablePlaneNode(Node):
         angles = np.arccos(np.clip(normals @ avg_normal, -1.0, 1.0))
         heights = np.array([sample[2] for sample in self.samples])
         angle_max = float(np.max(angles))
+        table_tilt = math.acos(float(np.clip(avg_normal[2], -1.0, 1.0)))
         height_std = float(np.std(heights))
+        if table_tilt > self.max_table_tilt:
+            if not self.table_tilt_rejected:
+                self.get_logger().warn(
+                    'Table plane rejected: tilt from base_link +Z is '
+                    f'{math.degrees(table_tilt):.2f} deg, limit is '
+                    f'{math.degrees(self.max_table_tilt):.2f} deg'
+                )
+                self.table_tilt_rejected = True
+            return None
+        if self.table_tilt_rejected:
+            self.get_logger().info('Table plane tilt recovered')
+            self.table_tilt_rejected = False
         if (
             angle_max > self.max_normal_deviation
             or height_std > self.max_height_std

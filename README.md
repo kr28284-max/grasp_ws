@@ -108,7 +108,7 @@ ros2 topic echo /grasp/router_status
 ```
 
 The OpenMANIPULATOR-X executor asks MoveIt to plan both equivalent parallel-jaw
-PRE-GRASP orientations with a 20-degree `OrientationConstraint`. It computes
+PRE-GRASP orientations with configured orientation constraints. It computes
 forward kinematics for each planned endpoint, selects the smallest valid
 orientation residual, and plans a complete Cartesian line from that PRE-GRASP
 endpoint to PICK. The verified trajectories are executed without replanning.
@@ -117,6 +117,14 @@ A failed constraint, residual, or Cartesian plan is reported as
 original object pose and grasp pose to the RB3 dummy adapter on the new
 `/grasp/rb3_dummy/candidate` topic. The existing
 `/grasp/rb3_dummy/execute` topic remains available.
+
+PRE-GRASP feasibility now searches from the table-normal vertical grasp toward
+an oblique grasp in configured 15-degree steps. It stops at the first tilt
+level with a valid plan, so the selected pose is as vertical as the 4-DOF arm
+can reach. Tilting is about the gripper closing axis, preserving finger
+alignment with the Duplo width. Planned FK is rejected if the approach does
+not point downward, the closing axis drifts, or the EE PICK point lacks the
+configured table clearance.
 
 Immediately before evaluating the selected PICK request, the controller prints
 the corresponding vision object pose once as base-frame XYZ and roll/pitch/yaw.
@@ -155,6 +163,17 @@ If the base-frame plane changes with arm pose, calibrate the camera mount TF
 first. Do not compensate for that error in the object pose. The image ROI,
 depth range, object exclusion margin, RANSAC tolerance, and stability limits
 are configurable in `src/grasp_vision/config/grasp_vision.yaml`.
+Stable planes tilted more than five degrees from `base_link +Z` are not used
+for object or grasp poses; this prevents a consistently wrong plane from
+tilting an otherwise flat Duplo pose.
+
+For Duplo detections, the filtered object cloud and table plane are matched by
+timestamp. Visible height is compared with the fixed 63.1 x 31.0 x 23.1 mm
+model to classify flat, side, or end placement. Yaw comes only from the cloud
+projected into table XY; object roll/pitch come from the table normal rather
+than a 3D PCA over mixed top and side surfaces. The box center is reconstructed
+from the table contact center plus half the selected vertical dimension.
+Ambiguous heights do not publish a grasp pose.
 
 The dummy adapter is intentionally not a success simulation. It prints the
 received frame, XYZ, and quaternion and reports `executed=false`, making it

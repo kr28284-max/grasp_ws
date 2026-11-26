@@ -26,12 +26,18 @@ table_plane_node:
     stability_window: 8
     min_stable_samples: 5
     max_normal_deviation_deg: 3.0
+    max_table_tilt_deg: 5.0
     max_height_std: 0.008
     marker_size: 0.40
 
 pose_estimation_node:
   ros__parameters:
     min_points: 30
+    base_frame: base_link
+    table_sync_slop_sec: 0.05
+    tf_timeout_sec: 0.15
+    duplo_height_tolerance: 0.012
+    duplo_height_ambiguity_margin: 0.002
     duplo_length: 0.0631
     duplo_width: 0.0310
     duplo_height: 0.0231

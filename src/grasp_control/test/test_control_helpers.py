@@ -3,7 +3,7 @@
 import math
 
 import pytest
-from geometry_msgs.msg import PoseStamped, Quaternion
+from geometry_msgs.msg import Point, PoseStamped, Quaternion
 
 from grasp_control.control_node import GraspControlNode
 
@@ -82,6 +82,38 @@ def test_example_grasp_matches_pick_after_axis_mapping_and_symmetry():
     assert math.degrees(min(residuals)) < 20.0
 
 
+def test_tilt_search_reaches_known_oblique_joint_orientation():
+    vision = Quaternion(x=-0.6360, y=-0.7717, z=0.0029, w=0.0033)
+    known_oblique = Quaternion(
+        x=-0.04687605,
+        y=0.28012025,
+        z=0.1582509,
+        w=0.9456701,
+    )
+    levels = GraspControlNode._tilted_ee_orientation_levels(
+        vision,
+        Point(x=0.219, y=0.119, z=0.104),
+        [-0.080, 0.0],
+        [0.0, 30.0, 60.0, 70.0, 80.0],
+    )
+
+    assert [level[0] for level in levels] == [
+        0.0, 30.0, 60.0, 70.0, 80.0
+    ]
+    sixty_degree_candidates = levels[2][1]
+    errors = [
+        GraspControlNode._orientation_error(candidate, known_oblique)
+        for _, candidate in sixty_degree_candidates
+    ]
+    assert math.degrees(min(errors)) < 10.0
+
+    vertical_axes = GraspControlNode._quaternion_axes(levels[0][1][0][1])
+    tilted_axes = GraspControlNode._quaternion_axes(levels[-1][1][0][1])
+    assert abs(float(vertical_axes[:, 1] @ tilted_axes[:, 1])) == pytest.approx(
+        1.0
+    )
+
+
 def test_quaternion_to_rpy_reports_expected_angles():
     half_yaw = math.radians(45.0)
     quaternion = Quaternion(
@@ -94,6 +126,24 @@ def test_quaternion_to_rpy_reports_expected_angles():
     assert math.degrees(roll) == pytest.approx(0.0)
     assert math.degrees(pitch) == pytest.approx(0.0)
     assert math.degrees(yaw) == pytest.approx(90.0)
+
+
+def test_quaternion_average_handles_signs_and_reports_deviation():
+    half_angle = math.radians(1.0)
+    first = [0.0, 0.0, math.sin(half_angle), math.cos(half_angle)]
+    second = [
+        0.0,
+        0.0,
+        -math.sin(half_angle),
+        -math.cos(half_angle),
+    ]
+
+    average, deviation = GraspControlNode._average_quaternions([
+        first, second
+    ])
+
+    assert average == pytest.approx(first)
+    assert deviation == pytest.approx(0.0, abs=1e-9)
 
 
 def test_goal_constraints_include_target_orientation_and_20_degree_limit():
