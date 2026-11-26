@@ -1,0 +1,3 @@
+std_msgs/Header header
+geometry_msgs/PoseStamped object_pose
+geometry_msgs/PoseStamped grasp_pose

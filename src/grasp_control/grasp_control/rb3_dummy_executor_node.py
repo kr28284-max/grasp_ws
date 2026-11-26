@@ -2,7 +2,7 @@
 
 import rclpy
 from geometry_msgs.msg import PoseStamped
-from grasp_interfaces.msg import GraspExecutionResult
+from grasp_interfaces.msg import GraspCandidate, GraspExecutionResult
 from rclpy.node import Node
 
 
@@ -17,12 +17,25 @@ class Rb3DummyExecutorNode(Node):
             self.execute_cb,
             10,
         )
+        self.create_subscription(
+            GraspCandidate,
+            '/grasp/rb3_dummy/candidate',
+            self.candidate_cb,
+            10,
+        )
         self.result_pub = self.create_publisher(
             GraspExecutionResult,
             '/grasp/rb3_dummy/result',
             10,
         )
         self.get_logger().info('RB3-730 dummy executor ready.')
+
+    def candidate_cb(self, candidate: GraspCandidate) -> None:
+        """Receive the paired source poses for a future RB3 simulator."""
+        self.get_logger().warn(
+            'RB3-730 DUMMY CANDIDATE: received object_pose and grasp_pose; '
+            'no simulator motion was executed.'
+        )
 
     def execute_cb(self, desired_pose: PoseStamped) -> None:
         position = desired_pose.pose.position

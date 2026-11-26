@@ -5,7 +5,7 @@ import time
 
 import rclpy
 from geometry_msgs.msg import PoseStamped
-from grasp_interfaces.msg import GraspExecutionResult
+from grasp_interfaces.msg import GraspCandidate, GraspExecutionResult
 from rclpy.node import Node
 from std_msgs.msg import Bool, String
 
@@ -32,9 +32,20 @@ class GraspRouterNode(Node):
         self.lock = threading.Lock()
         self.state = self.IDLE
         self.waiting_since = 0.0
+        self.latest_object_pose = None
+        self.active_candidate = None
 
         self.create_subscription(
             Bool, '/grasp/execute_trigger', self.trigger_cb, 10
+        )
+        self.create_subscription(
+            Bool, '/grasp/open_gripper_trigger', self.open_gripper_cb, 10
+        )
+        self.create_subscription(
+            Bool, '/grasp/home_trigger', self.home_trigger_cb, 10
+        )
+        self.create_subscription(
+            Bool, '/grasp/pause_trigger', self.pause_trigger_cb, 10
         )
         self.create_subscription(
             Bool,
@@ -46,6 +57,12 @@ class GraspRouterNode(Node):
             PoseStamped,
             '/grasp/base/desired_grasp_pose',
             self.candidate_cb,
+            10,
+        )
+        self.create_subscription(
+            PoseStamped,
+            '/grasp/base/object_pose',
+            self.object_pose_cb,
             10,
         )
         self.create_subscription(
@@ -70,8 +87,17 @@ class GraspRouterNode(Node):
         self.dummy_execute_pub = self.create_publisher(
             PoseStamped, '/grasp/rb3_dummy/execute', 10
         )
+        self.dummy_candidate_pub = self.create_publisher(
+            GraspCandidate, '/grasp/rb3_dummy/candidate', 10
+        )
         self.home_pub = self.create_publisher(
             Bool, '/grasp/openmanipulator/home', 10
+        )
+        self.open_gripper_pub = self.create_publisher(
+            Bool, '/grasp/openmanipulator/open_gripper', 10
+        )
+        self.pause_pub = self.create_publisher(
+            Bool, '/grasp/openmanipulator/pause', 10
         )
         self.status_pub = self.create_publisher(
             String, '/grasp/router_status', 10
@@ -91,6 +117,9 @@ class GraspRouterNode(Node):
         terminal.write(
             '\n=== Grasp keyboard menu ===\n'
             '1 : Start the complete grasp sequence\n'
+            'o : Open the gripper only\n'
+            '0 : Cancel the current action and move HOME\n'
+            'p : Pause at the current position\n'
             's : Show the current router state\n'
             'h : Show this menu again\n'
             'Ctrl+C : Stop all launched grasp nodes\n'
@@ -115,6 +144,15 @@ class GraspRouterNode(Node):
                             'Grasp trigger requested from keyboard.\n'
                         )
                         self.trigger_cb(Bool(data=True))
+                    elif command == 'o':
+                        tty_output.write('Gripper OPEN requested.\n')
+                        self.open_gripper_cb(Bool(data=True))
+                    elif command == '0':
+                        tty_output.write('Immediate HOME requested.\n')
+                        self.home_trigger_cb(Bool(data=True))
+                    elif command == 'p':
+                        tty_output.write('Pause requested.\n')
+                        self.pause_trigger_cb(Bool(data=True))
                     elif command == 's':
                         with self.lock:
                             state = self.state
@@ -149,6 +187,28 @@ class GraspRouterNode(Node):
         self.publish_status('PREPARING: Requesting RECOGNITION pose')
         self.prepare_pub.publish(Bool(data=True))
 
+    def open_gripper_cb(self, msg: Bool) -> None:
+        if not msg.data:
+            return
+        self.publish_status('COMMAND: Requesting gripper OPEN')
+        self.open_gripper_pub.publish(Bool(data=True))
+
+    def home_trigger_cb(self, msg: Bool) -> None:
+        if not msg.data:
+            return
+        with self.lock:
+            self.state = self.IDLE
+        self.publish_status('COMMAND: Cancelling current action and going HOME')
+        self.home_pub.publish(Bool(data=True))
+
+    def pause_trigger_cb(self, msg: Bool) -> None:
+        if not msg.data:
+            return
+        with self.lock:
+            self.state = self.IDLE
+        self.publish_status('COMMAND: Pausing at the current position')
+        self.pause_pub.publish(Bool(data=True))
+
     def openmanipulator_ready_cb(self, msg: Bool) -> None:
         with self.lock:
             if self.state != self.PREPARING:
@@ -174,10 +234,20 @@ class GraspRouterNode(Node):
             if self.state != self.WAITING_POSE:
                 return
             self.state = self.EXECUTING_OMX
+            candidate = GraspCandidate()
+            candidate.header = msg.header
+            if self.latest_object_pose is not None:
+                candidate.object_pose = self.latest_object_pose
+            candidate.grasp_pose = msg
+            self.active_candidate = candidate
         self.publish_status(
             'CHECKING: Sending desired 6D pose to OpenMANIPULATOR-X'
         )
         self.openmanipulator_execute_pub.publish(msg)
+
+    def object_pose_cb(self, msg: PoseStamped) -> None:
+        with self.lock:
+            self.latest_object_pose = msg
 
     def openmanipulator_result_cb(
         self,
@@ -200,6 +270,10 @@ class GraspRouterNode(Node):
                 f'(orientation residual={residual_deg:.1f} deg). '
                 'Routing to RB3-730 dummy.'
             )
+            with self.lock:
+                candidate = self.active_candidate
+            if candidate is not None:
+                self.dummy_candidate_pub.publish(candidate)
             self.dummy_execute_pub.publish(msg.desired_pose)
             return
 

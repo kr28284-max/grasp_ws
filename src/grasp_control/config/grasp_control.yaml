@@ -28,6 +28,8 @@ grasp_control_node:
     moveit_planning_time_sec: 3.0
     moveit_velocity_scale: 0.10
     moveit_acceleration_scale: 0.10
+    approach_cartesian_step_m: 0.005
+    approach_joint_jump_rad: 0.35
     retreat_cartesian_step_m: 0.005
     retreat_joint_jump_rad: 0.35
     action_server_timeout_sec: 10.0
@@ -43,9 +45,7 @@ grasp_control_node:
     workspace_min_xyz_m: [0.05, -0.30, 0.01]
     workspace_max_xyz_m: [0.45, 0.30, 0.45]
     return_home_on_error: true
-    
-    
-    max_orientation_residual_deg: 180.0   ##이거 원래 20 180은 테스트용
+    max_orientation_residual_deg: 20.0
 
 grasp_router_node:
   ros__parameters:

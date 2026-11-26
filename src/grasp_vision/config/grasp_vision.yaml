@@ -1,6 +1,6 @@
 yolo_seg_node:
   ros__parameters:
-    model_path: /home/user/grasp_ws/weights/best.pt
+    model_path: /home/user/grasp_ws/weights/best_openvino_model
     rgb_topic: /realsense/d435i/color/image_raw
     depth_topic: /realsense/d435i/aligned_depth_to_color/image_raw
     camera_info_topic: /realsense/d435i/color/camera_info

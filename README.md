@@ -67,6 +67,29 @@ ros2 topic pub --once /grasp/execute_trigger \
   std_msgs/msg/Bool "{data: true}"
 ```
 
+The controller launch terminal also provides manual safety commands:
+
+```text
+1 = start the complete grasp sequence
+o = open the gripper only
+0 = cancel the active action and move HOME
+p = cancel the active action and pause at the current position
+s = show router state
+h = show the menu
+```
+
+The same commands are available as one-shot topics:
+
+```bash
+ros2 topic pub --once /grasp/open_gripper_trigger std_msgs/msg/Bool "{data: true}"
+ros2 topic pub --once /grasp/home_trigger std_msgs/msg/Bool "{data: true}"
+ros2 topic pub --once /grasp/pause_trigger std_msgs/msg/Bool "{data: true}"
+```
+
+Pause cancels the active ROS action instead of preserving a trajectory index.
+The next sequence and immediate-HOME command therefore start from current joint
+feedback rather than accumulating an offset from the interrupted trajectory.
+
 The sequence is:
 
 ```text
@@ -74,7 +97,7 @@ HOME -> RECOGNITION -> fresh stable desired 6D grasp pose
      -> common router -> OpenMANIPULATOR-X feasibility check
 
 YES -> PRE-GRASP -> PICK -> CLOSE -> vertical RETREAT -> CARGO
-NO  -> HOME -> RB3-730 dummy adapter (logs the original 6D pose only)
+NO  -> HOME -> RB3-730 dummy adapter (receives object + grasp 6D poses)
 ```
 
 Monitor status with:
@@ -84,12 +107,20 @@ ros2 topic echo /grasp/control_status
 ros2 topic echo /grasp/router_status
 ```
 
-The OpenMANIPULATOR-X executor asks MoveIt to plan PRE-GRASP and PICK with
-`plan_only=true`, computes forward kinematics for the planned final joints, and
-compares that reachable 4DOF pose with the desired 6D quaternion. The default
-orientation residual limit is 20 degrees. A failed residual or plan is reported
-as `feasible=false`; no pick motion is executed and the router calls the RB3
-dummy adapter.
+The OpenMANIPULATOR-X executor asks MoveIt to plan both equivalent parallel-jaw
+PRE-GRASP orientations with a 20-degree `OrientationConstraint`. It computes
+forward kinematics for each planned endpoint, selects the smallest valid
+orientation residual, and plans a complete Cartesian line from that PRE-GRASP
+endpoint to PICK. The verified trajectories are executed without replanning.
+A failed constraint, residual, or Cartesian plan is reported as
+`feasible=false`; no pick motion is executed and the router sends both the
+original object pose and grasp pose to the RB3 dummy adapter on the new
+`/grasp/rb3_dummy/candidate` topic. The existing
+`/grasp/rb3_dummy/execute` topic remains available.
+
+Immediately before evaluating the selected PICK request, the controller prints
+the corresponding vision object pose once as base-frame XYZ and roll/pitch/yaw.
+It does not continuously print the vision pose stream.
 
 The dummy adapter is intentionally not a success simulation. It prints the
 received frame, XYZ, and quaternion and reports `executed=false`, making it
