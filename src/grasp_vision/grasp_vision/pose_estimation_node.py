@@ -5,7 +5,7 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import String, Header
-from geometry_msgs.msg import PoseStamped, Point, Quaternion, TransformStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped
 from visualization_msgs.msg import Marker, MarkerArray
 import tf2_ros
 

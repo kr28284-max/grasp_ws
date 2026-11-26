@@ -1,0 +1,10 @@
+std_msgs/Header header
+string robot_name
+bool feasible
+bool executed
+bool success
+geometry_msgs/PoseStamped desired_pose
+geometry_msgs/PoseStamped command_pose
+float64 position_residual_m
+float64 orientation_residual_rad
+string message

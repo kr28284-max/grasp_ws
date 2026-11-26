@@ -1,6 +1,7 @@
 import os
 import threading
 import time
+import traceback
 
 import cv2
 import numpy as np
@@ -36,8 +37,40 @@ class YoloSegPointCloudNode(Node):
         self.inference_stop = threading.Event()
         self.has_annotated_frame = False
 
+        # EATED hardware-compatible camera interfaces and model location.
+        self.declare_parameter(
+            'model_path',
+            '~/grasp_ws/weights/best_openvino_model'
+        )
+        self.declare_parameter(
+            'rgb_topic',
+            '/realsense/d435i/color/image_raw'
+        )
+        self.declare_parameter(
+            'depth_topic',
+            '/realsense/d435i/aligned_depth_to_color/image_raw'
+        )
+        self.declare_parameter(
+            'camera_info_topic',
+            '/realsense/d435i/color/camera_info'
+        )
+        self.declare_parameter(
+            'camera_optical_frame',
+            'd435i_color_optical_frame'
+        )
+        model_path = os.path.expanduser(
+            str(self.get_parameter('model_path').value)
+        )
+        self.rgb_topic = str(self.get_parameter('rgb_topic').value)
+        self.depth_topic = str(self.get_parameter('depth_topic').value)
+        self.camera_info_topic = str(
+            self.get_parameter('camera_info_topic').value
+        )
+        self.camera_frame_id = str(
+            self.get_parameter('camera_optical_frame').value
+        )
+
         # 1. OpenVINO FP16 모델 로드
-        model_path = os.path.expanduser('~/grasp_ws/weights/best_openvino_model')
         self.model = YOLO(model_path, task='segment')
         self.bridge = CvBridge()
 
@@ -45,7 +78,7 @@ class YoloSegPointCloudNode(Node):
         self.intrinsics = None
         self.create_subscription(
             CameraInfo,
-            '/camera/camera/color/camera_info',
+            self.camera_info_topic,
             self.camera_info_cb,
             qos_profile_sensor_data
         )
@@ -54,27 +87,19 @@ class YoloSegPointCloudNode(Node):
         rgb_sub = message_filters.Subscriber(
             self,
             Image,
-            '/camera/camera/color/image_raw',
+            self.rgb_topic,
             qos_profile=qos_profile_sensor_data
         )
         depth_sub = message_filters.Subscriber(
             self,
             Image,
-            '/camera/camera/aligned_depth_to_color/image_raw',
+            self.depth_topic,
             qos_profile=qos_profile_sensor_data
         )
         self.ts = message_filters.ApproximateTimeSynchronizer(
             [rgb_sub, depth_sub], queue_size=5, slop=0.05
         )
         self.ts.registerCallback(self.sync_cb)
-
-        # 카메라 광학 좌표계 (optical_frame) 보장
-        self.declare_parameter('camera_optical_frame', 'camera_color_optical_frame')
-        self.camera_frame_id = (
-            self.get_parameter('camera_optical_frame')
-            .get_parameter_value()
-            .string_value
-        )
 
         # 3. 퍼블리셔 (중복 제거: filtered_cloud 및 raw_cloud로 단일화)
         self.raw_cloud_pub = self.create_publisher(
@@ -132,7 +157,11 @@ class YoloSegPointCloudNode(Node):
             try:
                 self.process_frame(*frame_pair)
             except Exception as exc:
-                self.get_logger().error(f'Frame processing failed: {exc}')
+                self.get_logger().error(
+                    'Frame processing failed: '
+                    f'{type(exc).__name__}: {exc!r}\n'
+                    f'{traceback.format_exc()}'
+                )
 
     def process_frame(self, rgb_msg: Image, depth_msg: Image):
         color_img = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding='bgr8')
@@ -154,15 +183,14 @@ class YoloSegPointCloudNode(Node):
         vis_img = res.plot()
         cv2.putText(
             vis_img,
-            f'OpenVINO FP16 FPS: {inference_fps:.1f}',
+            f'YOLO FPS: {inference_fps:.1f}',
             (15, 35),
             cv2.FONT_HERSHEY_SIMPLEX,
             1.0,
             (0, 255, 0),
             2
         )
-        vis_msg = self.bridge.cv2_to_imgmsg(vis_img, encoding='bgr8')
-        vis_msg.header = rgb_msg.header
+        vis_msg = self.create_bgr8_image(rgb_msg.header, vis_img)
         self.vis_pub.publish(vis_msg)
 
         # 다음 추론이 끝날 때까지 현재 세그멘테이션 결과를 계속 유지
@@ -236,11 +264,10 @@ class YoloSegPointCloudNode(Node):
             z,
             int(np.count_nonzero(mask_eroded))
         )
-        reprojection_msg = self.bridge.cv2_to_imgmsg(
-            reprojection_img,
-            encoding='bgr8'
+        reprojection_msg = self.create_bgr8_image(
+            rgb_msg.header,
+            reprojection_img
         )
-        reprojection_msg.header = rgb_msg.header
         self.reprojection_pub.publish(reprojection_msg)
 
         cls_msg = String()
@@ -309,9 +336,31 @@ class YoloSegPointCloudNode(Node):
             (0, 0, 255),
             2
         )
-        image_msg = self.bridge.cv2_to_imgmsg(image, encoding='bgr8')
-        image_msg.header = header
+        image_msg = self.create_bgr8_image(header, image)
         self.reprojection_pub.publish(image_msg)
+
+    @staticmethod
+    def create_bgr8_image(header: Header, image: np.ndarray) -> Image:
+        """Create a bgr8 Image without the OpenCV-5 cv_bridge type check."""
+        if (
+            image.dtype != np.uint8
+            or image.ndim != 3
+            or image.shape[2] != 3
+        ):
+            raise ValueError(
+                'bgr8 image must have uint8 HxWx3 shape; '
+                f'got dtype={image.dtype}, shape={image.shape}'
+            )
+        contiguous = np.ascontiguousarray(image)
+        return Image(
+            header=header,
+            height=int(contiguous.shape[0]),
+            width=int(contiguous.shape[1]),
+            encoding='bgr8',
+            is_bigendian=False,
+            step=int(contiguous.strides[0]),
+            data=contiguous.tobytes(),
+        )
 
     def create_colored_pointcloud2(
         self,

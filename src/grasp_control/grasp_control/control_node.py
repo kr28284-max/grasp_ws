@@ -1,0 +1,958 @@
+"""Control the TurtleBot3 OpenMANIPULATOR-X grasp sequence."""
+
+import copy
+import math
+import threading
+import time
+from collections import deque
+from typing import Optional, Sequence
+
+import numpy as np
+import rclpy
+from action_msgs.msg import GoalStatus
+from builtin_interfaces.msg import Duration as DurationMsg
+from control_msgs.action import FollowJointTrajectory, GripperCommand
+from geometry_msgs.msg import Pose, PoseStamped
+from grasp_interfaces.msg import GraspExecutionResult
+from moveit_msgs.action import ExecuteTrajectory, MoveGroup
+from moveit_msgs.msg import Constraints, MoveItErrorCodes, PositionConstraint
+from moveit_msgs.srv import GetCartesianPath, GetPositionFK
+from rclpy.action import ActionClient
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.duration import Duration
+from rclpy.node import Node
+from rclpy.time import Time
+from sensor_msgs.msg import JointState
+from shape_msgs.msg import SolidPrimitive
+from std_msgs.msg import Bool, String
+from tf2_geometry_msgs import do_transform_pose_stamped
+from tf2_ros import Buffer, TransformException, TransformListener
+from trajectory_msgs.msg import JointTrajectoryPoint
+
+
+class GraspControlNode(Node):
+    """Run a guarded vision-to-pick sequence for OpenMANIPULATOR-X."""
+
+    JOINT_NAMES = ['joint1', 'joint2', 'joint3', 'joint4']
+
+    def __init__(self) -> None:
+        super().__init__('grasp_control_node')
+        self.callback_group = ReentrantCallbackGroup()
+        self.state_lock = threading.RLock()
+        self.pose_condition = threading.Condition(self.state_lock)
+
+        self._declare_parameters()
+        self._read_parameters()
+
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(
+            self.tf_buffer, self, spin_thread=False
+        )
+
+        self.current_class = ''
+        self.latest_camera_pose: Optional[PoseStamped] = None
+        self.latest_base_pose: Optional[PoseStamped] = None
+        self.stable_base_pose: Optional[PoseStamped] = None
+        self.stable_pose_time = 0.0
+        self.pose_samples = deque(maxlen=self.stable_sample_count)
+        self.current_joint_positions: Optional[list[float]] = None
+        self.is_busy = False
+
+        self.create_subscription(
+            String, '/grasp/target_class', self.class_cb, 10,
+            callback_group=self.callback_group
+        )
+        self.create_subscription(
+            PoseStamped, '/grasp/target_grasp_pose', self.grasp_pose_cb, 10,
+            callback_group=self.callback_group
+        )
+        self.create_subscription(
+            Bool,
+            '/grasp/openmanipulator/prepare',
+            self.prepare_cb,
+            10,
+            callback_group=self.callback_group,
+        )
+        self.create_subscription(
+            PoseStamped,
+            '/grasp/openmanipulator/execute',
+            self.execute_cb,
+            10,
+            callback_group=self.callback_group,
+        )
+        self.create_subscription(
+            Bool,
+            '/grasp/openmanipulator/home',
+            self.home_cb,
+            10,
+            callback_group=self.callback_group,
+        )
+        self.create_subscription(
+            JointState, '/joint_states', self.joint_state_cb, 10,
+            callback_group=self.callback_group
+        )
+
+        self.base_pose_pub = self.create_publisher(
+            PoseStamped, '/grasp/base/target_grasp_pose', 10
+        )
+        self.pre_grasp_pub = self.create_publisher(
+            PoseStamped, '/grasp/base/pre_grasp_pose', 10
+        )
+        self.status_pub = self.create_publisher(
+            String, '/grasp/control_status', 10
+        )
+        self.desired_pose_pub = self.create_publisher(
+            PoseStamped, '/grasp/base/desired_grasp_pose', 10
+        )
+        self.ready_pub = self.create_publisher(
+            Bool, '/grasp/openmanipulator/ready', 10
+        )
+        self.result_pub = self.create_publisher(
+            GraspExecutionResult, '/grasp/openmanipulator/result', 10
+        )
+
+        self.arm_joint_client = ActionClient(
+            self, FollowJointTrajectory,
+            '/arm_controller/follow_joint_trajectory',
+            callback_group=self.callback_group
+        )
+        self.gripper_client = ActionClient(
+            self, GripperCommand, '/gripper_controller/gripper_cmd',
+            callback_group=self.callback_group
+        )
+        self.move_group_client = ActionClient(
+            self, MoveGroup, '/move_action',
+            callback_group=self.callback_group
+        )
+        self.cartesian_path_client = self.create_client(
+            GetCartesianPath, '/compute_cartesian_path',
+            callback_group=self.callback_group
+        )
+        self.compute_fk_client = self.create_client(
+            GetPositionFK, '/compute_fk',
+            callback_group=self.callback_group,
+        )
+        self.execute_trajectory_client = ActionClient(
+            self, ExecuteTrajectory, '/execute_trajectory',
+            callback_group=self.callback_group
+        )
+
+        self.get_logger().info(
+            'TurtleBot3 OpenMANIPULATOR-X grasp controller initialized.'
+        )
+        if self.home_on_startup:
+            with self.state_lock:
+                self.is_busy = True
+            threading.Thread(
+                target=self._startup_home,
+                name='startup-home',
+                daemon=True,
+            ).start()
+        else:
+            self.publish_status('IDLE: Waiting for execute trigger')
+
+    def _declare_parameters(self) -> None:
+        self.declare_parameter('base_frame', 'base_link')
+        self.declare_parameter('move_group_name', 'arm')
+        self.declare_parameter('end_effector_link', 'end_effector_link')
+        self.declare_parameter('home_on_startup', True)
+        self.declare_parameter('home_pose_deg', [0.0, -101.0, 53.0, 70.0])
+        self.declare_parameter(
+            'recognition_pose_deg', [0.0, -19.0, 0.0, 75.0]
+        )
+        self.declare_parameter(
+            'cargo_pose_deg', [-73.0, -30.0, 38.0, -10.0]
+        )
+        self.declare_parameter('joint_motion_duration_sec', 4.0)
+        self.declare_parameter('recognition_settle_sec', 0.5)
+        self.declare_parameter('gripper_open_position', 0.019)
+        self.declare_parameter('gripper_closed_position', -0.010)
+        self.declare_parameter('gripper_max_effort', 0.2)
+        self.declare_parameter('grasp_position_threshold', -0.008)
+        self.declare_parameter('pick_calibration_xyz_m', [0.0, 0.0, 0.0])
+        self.declare_parameter('pregrasp_offset_xyz_m', [0.0, 0.0, 0.05])
+        self.declare_parameter('retreat_offset_z_m', 0.15)
+        self.declare_parameter(
+            'pick_orientation_xyzw',
+            [0.0, 0.7071068, 0.0, 0.7071068],
+        )
+        self.declare_parameter('position_tolerance_m', 0.01)
+        self.declare_parameter('moveit_planning_time_sec', 3.0)
+        self.declare_parameter('moveit_velocity_scale', 0.10)
+        self.declare_parameter('moveit_acceleration_scale', 0.10)
+        self.declare_parameter('retreat_cartesian_step_m', 0.005)
+        self.declare_parameter('retreat_joint_jump_rad', 0.35)
+        self.declare_parameter('action_server_timeout_sec', 10.0)
+        self.declare_parameter('action_result_timeout_sec', 20.0)
+        self.declare_parameter('pose_wait_timeout_sec', 10.0)
+        self.declare_parameter('pose_max_age_sec', 0.5)
+        self.declare_parameter('tf_timeout_sec', 0.2)
+        self.declare_parameter('stable_sample_count', 5)
+        self.declare_parameter('max_position_stddev_m', 0.005)
+        self.declare_parameter('workspace_min_xyz_m', [0.05, -0.30, 0.01])
+        self.declare_parameter('workspace_max_xyz_m', [0.45, 0.30, 0.45])
+        self.declare_parameter('return_home_on_error', True)
+        self.declare_parameter('max_orientation_residual_deg', 20.0)
+
+    def _read_parameters(self) -> None:
+        def value(name: str):
+            return self.get_parameter(name).value
+
+        self.base_frame = str(value('base_frame'))
+        self.move_group_name = str(value('move_group_name'))
+        self.end_effector_link = str(value('end_effector_link'))
+        self.home_on_startup = bool(value('home_on_startup'))
+        self.home_pose = self._degrees_pose(value('home_pose_deg'))
+        self.recognition_pose = self._degrees_pose(value('recognition_pose_deg'))
+        self.cargo_pose = self._degrees_pose(value('cargo_pose_deg'))
+        self.joint_motion_duration = float(value('joint_motion_duration_sec'))
+        self.recognition_settle = float(value('recognition_settle_sec'))
+        self.gripper_open = float(value('gripper_open_position'))
+        self.gripper_closed = float(value('gripper_closed_position'))
+        self.gripper_effort = float(value('gripper_max_effort'))
+        self.grasp_position_threshold = float(
+            value('grasp_position_threshold')
+        )
+        self.pick_calibration = self._xyz(value('pick_calibration_xyz_m'))
+        self.pregrasp_offset = self._xyz(value('pregrasp_offset_xyz_m'))
+        self.retreat_offset_z = float(value('retreat_offset_z_m'))
+        self.pick_orientation = self._quaternion(
+            value('pick_orientation_xyzw')
+        )
+        self.position_tolerance = float(value('position_tolerance_m'))
+        self.moveit_planning_time = float(value('moveit_planning_time_sec'))
+        self.velocity_scale = float(value('moveit_velocity_scale'))
+        self.acceleration_scale = float(value('moveit_acceleration_scale'))
+        self.retreat_step = float(value('retreat_cartesian_step_m'))
+        self.retreat_joint_jump = float(value('retreat_joint_jump_rad'))
+        self.server_timeout = float(value('action_server_timeout_sec'))
+        self.result_timeout = float(value('action_result_timeout_sec'))
+        self.pose_wait_timeout = float(value('pose_wait_timeout_sec'))
+        self.pose_max_age = float(value('pose_max_age_sec'))
+        self.tf_timeout = float(value('tf_timeout_sec'))
+        self.stable_sample_count = int(value('stable_sample_count'))
+        self.max_position_stddev = float(value('max_position_stddev_m'))
+        self.workspace_min = self._xyz(value('workspace_min_xyz_m'))
+        self.workspace_max = self._xyz(value('workspace_max_xyz_m'))
+        self.return_home_on_error = bool(value('return_home_on_error'))
+        self.max_orientation_residual = math.radians(
+            float(value('max_orientation_residual_deg'))
+        )
+
+        if self.stable_sample_count < 1:
+            raise ValueError('stable_sample_count must be positive')
+        if not (
+            self.gripper_closed
+            < self.grasp_position_threshold
+            < self.gripper_open
+        ):
+            raise ValueError(
+                'grasp_position_threshold must be between closed and open'
+            )
+        if any(
+            low >= high
+            for low, high in zip(self.workspace_min, self.workspace_max)
+        ):
+            raise ValueError('workspace minimums must be lower than maximums')
+        if not 0.0 < self.velocity_scale <= 1.0:
+            raise ValueError('moveit_velocity_scale must be in (0, 1]')
+        if not 0.0 < self.acceleration_scale <= 1.0:
+            raise ValueError('moveit_acceleration_scale must be in (0, 1]')
+
+    @staticmethod
+    def _degrees_pose(values: Sequence[float]) -> list[float]:
+        if len(values) != 4:
+            raise ValueError('joint poses must contain four values')
+        return [math.radians(float(item)) for item in values]
+
+    @staticmethod
+    def _xyz(values: Sequence[float]) -> tuple[float, float, float]:
+        if len(values) != 3:
+            raise ValueError('XYZ parameters must contain three values')
+        return tuple(float(item) for item in values)
+
+    @staticmethod
+    def _quaternion(
+        values: Sequence[float],
+    ) -> tuple[float, float, float, float]:
+        if len(values) != 4:
+            raise ValueError('quaternion parameters must contain four values')
+        quaternion = np.asarray(values, dtype=np.float64)
+        norm = float(np.linalg.norm(quaternion))
+        if norm < 1e-9:
+            raise ValueError('pick quaternion must not be zero')
+        return tuple(float(item) for item in quaternion / norm)
+
+    def publish_status(self, text: str) -> None:
+        self.status_pub.publish(String(data=text))
+        self.get_logger().info(f'[STATUS] {text}')
+
+    def class_cb(self, msg: String) -> None:
+        with self.pose_condition:
+            self.current_class = msg.data.strip()
+            if not self.current_class:
+                self._clear_pose_locked()
+
+    def joint_state_cb(self, msg: JointState) -> None:
+        positions = dict(zip(msg.name, msg.position))
+        if all(name in positions for name in self.JOINT_NAMES):
+            with self.state_lock:
+                self.current_joint_positions = [
+                    float(positions[name]) for name in self.JOINT_NAMES
+                ]
+
+    def grasp_pose_cb(self, msg: PoseStamped) -> None:
+        if not msg.header.frame_id:
+            self.get_logger().warn('Rejected grasp pose with an empty frame_id')
+            return
+        self.latest_camera_pose = msg
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.base_frame,
+                msg.header.frame_id,
+                Time.from_msg(msg.header.stamp),
+                timeout=Duration(seconds=self.tf_timeout),
+            )
+            base_pose = do_transform_pose_stamped(msg, transform)
+            base_pose.header.frame_id = self.base_frame
+            self.base_pose_pub.publish(base_pose)
+            self._record_pose_sample(base_pose)
+        except TransformException as exc:
+            self.get_logger().warn(
+                f'TF unavailable for {msg.header.frame_id} -> '
+                f'{self.base_frame}: {exc}',
+                throttle_duration_sec=2.0,
+            )
+
+    def _record_pose_sample(self, pose: PoseStamped) -> None:
+        point = np.array([
+            pose.pose.position.x,
+            pose.pose.position.y,
+            pose.pose.position.z,
+        ])
+        if not np.isfinite(point).all():
+            return
+
+        with self.pose_condition:
+            self.latest_base_pose = pose
+            self.pose_samples.append(point)
+            if len(self.pose_samples) < self.stable_sample_count:
+                return
+            samples = np.asarray(self.pose_samples)
+            if float(np.max(np.std(samples, axis=0))) > self.max_position_stddev:
+                return
+
+            median = np.median(samples, axis=0)
+            stable = PoseStamped()
+            stable.header = pose.header
+            stable.pose = copy.deepcopy(pose.pose)
+            stable.pose.position.x = float(median[0])
+            stable.pose.position.y = float(median[1])
+            stable.pose.position.z = float(median[2])
+            self.stable_base_pose = stable
+            self.stable_pose_time = time.monotonic()
+            self.pose_condition.notify_all()
+            self.desired_pose_pub.publish(stable)
+            self.pre_grasp_pub.publish(
+                self._offset_pose(stable, self.pregrasp_offset)
+            )
+
+    def _clear_pose_locked(self) -> None:
+        self.latest_camera_pose = None
+        self.latest_base_pose = None
+        self.stable_base_pose = None
+        self.stable_pose_time = 0.0
+        self.pose_samples.clear()
+
+    def prepare_cb(self, msg: Bool) -> None:
+        if not msg.data:
+            return
+        with self.state_lock:
+            if self.is_busy:
+                self.get_logger().warn('Controller is busy; prepare ignored.')
+                self.ready_pub.publish(Bool(data=False))
+                return
+            self.is_busy = True
+        threading.Thread(
+            target=self._prepare_for_candidate,
+            name='prepare-recognition',
+            daemon=True,
+        ).start()
+
+    def execute_cb(self, desired_pose: PoseStamped) -> None:
+        with self.state_lock:
+            if self.is_busy:
+                self.get_logger().warn('Controller is busy; execute ignored.')
+                self._publish_result(
+                    desired_pose,
+                    desired_pose,
+                    feasible=False,
+                    executed=False,
+                    success=False,
+                    orientation_residual=math.inf,
+                    message='OpenMANIPULATOR-X executor is busy.',
+                )
+                return
+            self.is_busy = True
+        threading.Thread(
+            target=self._execute_candidate,
+            args=(desired_pose,),
+            name='openmanipulator-execution',
+            daemon=True,
+        ).start()
+
+    def home_cb(self, msg: Bool) -> None:
+        if not msg.data:
+            return
+        with self.state_lock:
+            if self.is_busy:
+                self.get_logger().warn('Controller is busy; HOME ignored.')
+                return
+            self.is_busy = True
+        threading.Thread(
+            target=self._command_home,
+            name='command-home',
+            daemon=True,
+        ).start()
+
+    def _startup_home(self) -> None:
+        try:
+            self.publish_status('STARTUP: Moving to HOME')
+            self._send_joint_pose(self.home_pose, 'HOME')
+            self.publish_status('IDLE: HOME reached; waiting for execute trigger')
+        except Exception as exc:
+            self.publish_status(f'ERROR: Startup HOME failed: {exc}')
+        finally:
+            with self.state_lock:
+                self.is_busy = False
+
+    def _command_home(self) -> None:
+        try:
+            self.publish_status('HOME: Returning to HOME pose')
+            self._send_joint_pose(self.home_pose, 'HOME')
+            self.publish_status('IDLE: HOME reached')
+        except Exception as exc:
+            self.publish_status(f'ERROR: HOME failed: {exc}')
+        finally:
+            with self.state_lock:
+                self.is_busy = False
+
+    def _prepare_for_candidate(self) -> None:
+        ready = False
+        try:
+            self.publish_status('PREPARE: Moving to RECOGNITION pose')
+            self._send_joint_pose(self.recognition_pose, 'RECOGNITION')
+            time.sleep(self.recognition_settle)
+            with self.pose_condition:
+                self._clear_pose_locked()
+            ready = True
+            self.publish_status(
+                'READY: RECOGNITION reached; collecting fresh pose samples'
+            )
+        except Exception as exc:
+            self.publish_status(f'ERROR: RECOGNITION failed: {exc}')
+        finally:
+            with self.state_lock:
+                self.is_busy = False
+            self.ready_pub.publish(Bool(data=ready))
+
+    def _execute_candidate(self, desired_pose: PoseStamped) -> None:
+        result_published = False
+        command_pose = self._command_pose(desired_pose)
+        orientation_residual = math.inf
+        try:
+            pick = self._offset_pose(command_pose, self.pick_calibration)
+            self._validate_workspace(pick)
+            pregrasp = self._offset_pose(pick, self.pregrasp_offset)
+            self._validate_workspace(pregrasp)
+
+            self.publish_status('CHECK: Planning PRE-GRASP without execution')
+            if self._move_group_pose(
+                pregrasp, 'PRE-GRASP CHECK', plan_only=True
+            ) is None:
+                raise ValueError('MoveIt could not plan PRE-GRASP')
+            self.publish_status('CHECK: Planning PICK without execution')
+            pick_plan = self._move_group_pose(
+                pick, 'PICK CHECK', plan_only=True
+            )
+            if pick_plan is None:
+                raise ValueError('MoveIt could not plan PICK')
+
+            command_pose = self._planned_command_pose(pick_plan)
+            orientation_residual = self._orientation_error(
+                desired_pose.pose.orientation,
+                command_pose.pose.orientation,
+            )
+            if orientation_residual > self.max_orientation_residual:
+                reason = (
+                    'planned 4DOF orientation exceeds the residual limit: '
+                    f'{math.degrees(orientation_residual):.1f} deg > '
+                    f'{math.degrees(self.max_orientation_residual):.1f} deg'
+                )
+                self.publish_status(f'INFEASIBLE: {reason}')
+                self._safe_return_home('INFEASIBLE')
+                self._publish_result(
+                    desired_pose,
+                    command_pose,
+                    feasible=False,
+                    executed=False,
+                    success=False,
+                    orientation_residual=orientation_residual,
+                    message=reason,
+                )
+                result_published = True
+                return
+
+            self.publish_status('EXECUTE: Opening gripper')
+            self._send_gripper(self.gripper_open, 'OPEN')
+            self.publish_status('EXECUTE: Moving to PRE-GRASP')
+            self._send_cartesian_pose(pregrasp, 'PRE-GRASP')
+            self.publish_status('EXECUTE: Approaching PICK')
+            self._send_cartesian_pose(pick, 'PICK')
+            self.publish_status('EXECUTE: Closing gripper')
+            self._send_gripper(self.gripper_closed, 'CLOSE', accept_stall=True)
+            self.publish_status('EXECUTE: Vertical retreat')
+            self._send_vertical_retreat()
+            self.publish_status('EXECUTE: Moving to CARGO pose')
+            self._send_joint_pose(self.cargo_pose, 'CARGO')
+            self.publish_status('SUCCESS: OpenMANIPULATOR-X pick completed')
+            self._publish_result(
+                desired_pose,
+                command_pose,
+                feasible=True,
+                executed=True,
+                success=True,
+                orientation_residual=orientation_residual,
+                message='OpenMANIPULATOR-X pick completed.',
+            )
+            result_published = True
+        except ValueError as exc:
+            self.publish_status(f'INFEASIBLE: {exc}')
+            self._safe_return_home('INFEASIBLE')
+            self._publish_result(
+                desired_pose,
+                command_pose,
+                feasible=False,
+                executed=False,
+                success=False,
+                orientation_residual=orientation_residual,
+                message=str(exc),
+            )
+            result_published = True
+        except Exception as exc:
+            self.publish_status(f'ERROR: OpenMANIPULATOR-X execution failed: {exc}')
+            if self.return_home_on_error:
+                try:
+                    self.publish_status('RECOVERY: Returning HOME')
+                    self._send_joint_pose(self.home_pose, 'HOME')
+                except Exception as home_exc:
+                    self.publish_status(f'ERROR: HOME recovery failed: {home_exc}')
+            if not result_published:
+                self._publish_result(
+                    desired_pose,
+                    command_pose,
+                    feasible=True,
+                    executed=True,
+                    success=False,
+                    orientation_residual=orientation_residual,
+                    message=str(exc),
+                )
+                result_published = True
+        finally:
+            with self.state_lock:
+                self.is_busy = False
+
+    def _safe_return_home(self, reason: str) -> None:
+        try:
+            self.publish_status(f'{reason}: Returning HOME')
+            self._send_joint_pose(self.home_pose, 'HOME')
+        except Exception as exc:
+            self.publish_status(f'ERROR: HOME after {reason} failed: {exc}')
+
+    def _command_pose(self, desired_pose: PoseStamped) -> PoseStamped:
+        command = copy.deepcopy(desired_pose)
+        (
+            command.pose.orientation.x,
+            command.pose.orientation.y,
+            command.pose.orientation.z,
+            command.pose.orientation.w,
+        ) = self.pick_orientation
+        return command
+
+    @staticmethod
+    def _orientation_error(first, second) -> float:
+        first_array = np.array([first.x, first.y, first.z, first.w])
+        second_array = np.array([second.x, second.y, second.z, second.w])
+        first_norm = float(np.linalg.norm(first_array))
+        second_norm = float(np.linalg.norm(second_array))
+        if first_norm < 1e-9 or second_norm < 1e-9:
+            return math.inf
+        dot = abs(float(np.dot(
+            first_array / first_norm,
+            second_array / second_norm,
+        )))
+        return 2.0 * math.acos(min(1.0, max(-1.0, dot)))
+
+    def _publish_result(
+        self,
+        desired_pose: PoseStamped,
+        command_pose: PoseStamped,
+        *,
+        feasible: bool,
+        executed: bool,
+        success: bool,
+        orientation_residual: float,
+        message: str,
+    ) -> None:
+        result = GraspExecutionResult()
+        result.header = desired_pose.header
+        result.robot_name = 'openmanipulator_x'
+        result.feasible = feasible
+        result.executed = executed
+        result.success = success
+        result.desired_pose = desired_pose
+        result.command_pose = command_pose
+        delta = np.array([
+            desired_pose.pose.position.x - command_pose.pose.position.x,
+            desired_pose.pose.position.y - command_pose.pose.position.y,
+            desired_pose.pose.position.z - command_pose.pose.position.z,
+        ])
+        result.position_residual_m = float(np.linalg.norm(delta))
+        result.orientation_residual_rad = orientation_residual
+        result.message = message
+        self.result_pub.publish(result)
+
+    @staticmethod
+    def _offset_pose(
+        source: PoseStamped,
+        offset: Sequence[float],
+    ) -> PoseStamped:
+        result = PoseStamped()
+        result.header = source.header
+        result.pose = copy.deepcopy(source.pose)
+        result.pose.position.x += float(offset[0])
+        result.pose.position.y += float(offset[1])
+        result.pose.position.z += float(offset[2])
+        return result
+
+    def _validate_workspace(self, pose: PoseStamped) -> None:
+        point = (
+            pose.pose.position.x,
+            pose.pose.position.y,
+            pose.pose.position.z,
+        )
+        if not all(math.isfinite(value) for value in point):
+            raise ValueError('target contains a non-finite coordinate')
+        if any(
+            value < low or value > high
+            for value, low, high in zip(
+                point, self.workspace_min, self.workspace_max
+            )
+        ):
+            raise ValueError(
+                f'target {point} is outside workspace '
+                f'{self.workspace_min} .. {self.workspace_max}'
+            )
+
+    def _send_joint_pose(self, positions: Sequence[float], label: str) -> None:
+        self._wait_action_server(self.arm_joint_client, 'arm trajectory')
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory.joint_names = list(self.JOINT_NAMES)
+        point = JointTrajectoryPoint()
+        point.positions = list(positions)
+        point.time_from_start = self._duration_message(
+            self.joint_motion_duration
+        )
+        goal.trajectory.points.append(point)
+        response = self._run_action(
+            self.arm_joint_client,
+            goal,
+            f'arm {label}',
+            self.joint_motion_duration + 8.0,
+        )
+        if (
+            response.status != GoalStatus.STATUS_SUCCEEDED
+            or response.result.error_code
+            != FollowJointTrajectory.Result.SUCCESSFUL
+        ):
+            raise RuntimeError(
+                f'{label} trajectory failed: '
+                f'{response.result.error_string or response.result.error_code}'
+            )
+
+    def _send_gripper(
+        self,
+        position: float,
+        label: str,
+        accept_stall: bool = False,
+    ) -> None:
+        self._wait_action_server(self.gripper_client, 'gripper')
+        goal = GripperCommand.Goal()
+        goal.command.position = float(position)
+        goal.command.max_effort = self.gripper_effort
+        response = self._run_action(
+            self.gripper_client, goal, f'gripper {label}'
+        )
+        result = response.result
+        if accept_stall:
+            if (
+                result.stalled
+                and result.position >= self.grasp_position_threshold
+            ):
+                self.get_logger().info(
+                    f'Grasp confirmed at gripper position {result.position:.4f}'
+                )
+                return
+            if result.reached_goal:
+                raise RuntimeError('gripper fully closed; no object was detected')
+            raise RuntimeError(
+                f'grasp not confirmed: position={result.position:.4f}, '
+                f'stalled={result.stalled}'
+            )
+        if response.status != GoalStatus.STATUS_SUCCEEDED:
+            raise RuntimeError(
+                f'gripper {label} failed with status {response.status}'
+            )
+
+    def _send_cartesian_pose(self, target: PoseStamped, label: str) -> None:
+        if self._move_group_pose(target, label, plan_only=False) is None:
+            raise RuntimeError(f'MoveIt {label} failed')
+
+    def _move_group_pose(
+        self,
+        target: PoseStamped,
+        label: str,
+        *,
+        plan_only: bool,
+    ):
+        self._wait_action_server(self.move_group_client, 'MoveIt')
+        goal = MoveGroup.Goal()
+        goal.request.group_name = self.move_group_name
+        goal.request.allowed_planning_time = self.moveit_planning_time
+        goal.request.num_planning_attempts = 3
+        goal.request.max_velocity_scaling_factor = self.velocity_scale
+        goal.request.max_acceleration_scaling_factor = self.acceleration_scale
+        goal.planning_options.plan_only = plan_only
+        goal.planning_options.replan = True
+        goal.planning_options.replan_attempts = 2
+
+        pose = Pose()
+        pose.position = target.pose.position
+        (
+            pose.orientation.x,
+            pose.orientation.y,
+            pose.orientation.z,
+            pose.orientation.w,
+        ) = self.pick_orientation
+
+        position_constraint = PositionConstraint()
+        position_constraint.header.frame_id = self.base_frame
+        position_constraint.link_name = self.end_effector_link
+        box = SolidPrimitive()
+        box.type = SolidPrimitive.BOX
+        box.dimensions = [self.position_tolerance] * 3
+        position_constraint.constraint_region.primitives.append(box)
+        position_constraint.constraint_region.primitive_poses.append(pose)
+        position_constraint.weight = 1.0
+        constraints = Constraints()
+        constraints.position_constraints.append(position_constraint)
+        goal.request.goal_constraints.append(constraints)
+
+        response = self._run_action(
+            self.move_group_client, goal, f'MoveIt {label}'
+        )
+        failed = (
+            response.status != GoalStatus.STATUS_SUCCEEDED
+            or response.result.error_code.val != MoveItErrorCodes.SUCCESS
+        )
+        if failed:
+            self.get_logger().warn(
+                f'MoveIt {label} failed: error={response.result.error_code.val}'
+            )
+            return None
+        return response
+
+    def _planned_command_pose(self, move_group_response) -> PoseStamped:
+        trajectory = move_group_response.result.planned_trajectory.joint_trajectory
+        if not trajectory.joint_names or not trajectory.points:
+            raise ValueError('MoveIt plan has no final joint state for FK')
+        final_positions = trajectory.points[-1].positions
+        if len(final_positions) != len(trajectory.joint_names):
+            raise ValueError('MoveIt final joint state is incomplete')
+
+        deadline = time.monotonic() + self.server_timeout
+        while not self.compute_fk_client.wait_for_service(timeout_sec=0.1):
+            if time.monotonic() >= deadline:
+                raise RuntimeError('MoveIt FK service is unavailable')
+
+        request = GetPositionFK.Request()
+        request.header.frame_id = self.base_frame
+        request.fk_link_names = [self.end_effector_link]
+        request.robot_state.is_diff = True
+        request.robot_state.joint_state.name = list(trajectory.joint_names)
+        request.robot_state.joint_state.position = list(final_positions)
+        response = self._wait_future(
+            self.compute_fk_client.call_async(request),
+            'planned-pose FK',
+            self.result_timeout,
+        )
+        if (
+            response.error_code.val != MoveItErrorCodes.SUCCESS
+            or not response.pose_stamped
+        ):
+            raise ValueError(
+                f'MoveIt FK failed: error={response.error_code.val}'
+            )
+        return response.pose_stamped[0]
+
+    def _send_vertical_retreat(self) -> None:
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.base_frame,
+                self.end_effector_link,
+                Time(),
+                timeout=Duration(seconds=1.0),
+            )
+        except TransformException as exc:
+            raise RuntimeError(
+                f'end-effector pose unavailable: {exc}'
+            ) from exc
+
+        with self.state_lock:
+            joints = (
+                list(self.current_joint_positions)
+                if self.current_joint_positions is not None
+                else None
+            )
+        if joints is None:
+            raise RuntimeError('joint states unavailable for vertical retreat')
+
+        waypoint = Pose()
+        waypoint.position.x = transform.transform.translation.x
+        waypoint.position.y = transform.transform.translation.y
+        waypoint.position.z = (
+            transform.transform.translation.z + self.retreat_offset_z
+        )
+        waypoint.orientation = transform.transform.rotation
+
+        deadline = time.monotonic() + self.server_timeout
+        while not self.cartesian_path_client.wait_for_service(timeout_sec=0.1):
+            if time.monotonic() >= deadline:
+                raise RuntimeError('Cartesian path service is unavailable')
+
+        request = GetCartesianPath.Request()
+        request.header.frame_id = self.base_frame
+        request.start_state.is_diff = True
+        request.start_state.joint_state.name = list(self.JOINT_NAMES)
+        request.start_state.joint_state.position = joints
+        request.group_name = self.move_group_name
+        request.link_name = self.end_effector_link
+        request.waypoints = [waypoint]
+        request.max_step = self.retreat_step
+        request.revolute_jump_threshold = self.retreat_joint_jump
+        request.avoid_collisions = True
+        request.max_velocity_scaling_factor = self.velocity_scale
+        request.max_acceleration_scaling_factor = self.acceleration_scale
+        response = self._wait_future(
+            self.cartesian_path_client.call_async(request),
+            'Cartesian retreat plan',
+            self.result_timeout,
+        )
+        if (
+            response.error_code.val != MoveItErrorCodes.SUCCESS
+            or not math.isfinite(response.fraction)
+            or response.fraction <= 0.0
+            or len(response.solution.joint_trajectory.points) < 2
+        ):
+            raise RuntimeError(
+                f'no retreat path: fraction={response.fraction:.3f}, '
+                f'error={response.error_code.val}'
+            )
+        if response.fraction < 0.999:
+            self.get_logger().warn(
+                f'Only {response.fraction * 100.0:.1f}% of the retreat '
+                'was reachable; executing that collision-checked segment.'
+            )
+
+        self._wait_action_server(
+            self.execute_trajectory_client, 'trajectory execution'
+        )
+        goal = ExecuteTrajectory.Goal()
+        goal.trajectory = response.solution
+        execution = self._run_action(
+            self.execute_trajectory_client, goal, 'retreat execution'
+        )
+        if (
+            execution.status != GoalStatus.STATUS_SUCCEEDED
+            or execution.result.error_code.val != MoveItErrorCodes.SUCCESS
+        ):
+            raise RuntimeError(
+                'retreat execution failed: '
+                f'error={execution.result.error_code.val}'
+            )
+
+    def _wait_action_server(self, client: ActionClient, label: str) -> None:
+        if not client.wait_for_server(timeout_sec=self.server_timeout):
+            raise RuntimeError(f'{label} action server is unavailable')
+
+    def _run_action(
+        self,
+        client: ActionClient,
+        goal,
+        label: str,
+        timeout: Optional[float] = None,
+    ):
+        goal_handle = self._wait_future(
+            client.send_goal_async(goal),
+            f'{label} goal response',
+            self.server_timeout,
+        )
+        if goal_handle is None or not goal_handle.accepted:
+            raise RuntimeError(f'{label} goal was rejected')
+        try:
+            return self._wait_future(
+                goal_handle.get_result_async(),
+                f'{label} result',
+                self.result_timeout if timeout is None else timeout,
+            )
+        except Exception:
+            goal_handle.cancel_goal_async()
+            raise
+
+    @staticmethod
+    def _duration_message(seconds: float) -> DurationMsg:
+        whole = int(seconds)
+        return DurationMsg(
+            sec=whole,
+            nanosec=int((seconds - whole) * 1_000_000_000),
+        )
+
+    @staticmethod
+    def _wait_future(future, label: str, timeout: float):
+        deadline = time.monotonic() + timeout
+        while rclpy.ok() and not future.done():
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f'{label} timed out')
+            time.sleep(0.02)
+        if not future.done():
+            raise RuntimeError(f'{label} interrupted by shutdown')
+        exception = future.exception()
+        if exception is not None:
+            raise RuntimeError(f'{label} failed: {exception}') from exception
+        return future.result()
+
+
+def main(args=None) -> None:
+    rclpy.init(args=args)
+    node = GraspControlNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+if __name__ == '__main__':
+    main()
