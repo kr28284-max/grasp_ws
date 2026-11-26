@@ -13,7 +13,7 @@ from action_msgs.msg import GoalStatus
 from builtin_interfaces.msg import Duration as DurationMsg
 from control_msgs.action import FollowJointTrajectory, GripperCommand
 from geometry_msgs.msg import Pose, PoseStamped, Quaternion
-from grasp_interfaces.msg import GraspExecutionResult
+from grasp_interfaces.msg import GraspExecutionResult, TablePlane
 from moveit_msgs.action import ExecuteTrajectory, MoveGroup
 from moveit_msgs.msg import (
     Constraints,
@@ -66,6 +66,7 @@ class GraspControlNode(Node):
         self.latest_camera_pose: Optional[PoseStamped] = None
         self.latest_base_pose: Optional[PoseStamped] = None
         self.latest_object_base_pose: Optional[PoseStamped] = None
+        self.latest_table_plane: Optional[TablePlane] = None
         self.stable_base_pose: Optional[PoseStamped] = None
         self.stable_pose_time = 0.0
         self.pose_samples = deque(maxlen=self.stable_sample_count)
@@ -85,6 +86,10 @@ class GraspControlNode(Node):
         )
         self.create_subscription(
             PoseStamped, '/grasp/object_pose', self.object_pose_cb, 10,
+            callback_group=self.callback_group
+        )
+        self.create_subscription(
+            TablePlane, '/grasp/table_plane', self.table_plane_cb, 10,
             callback_group=self.callback_group
         )
         self.create_subscription(
@@ -390,6 +395,11 @@ class GraspControlNode(Node):
                 throttle_duration_sec=2.0,
             )
 
+    def table_plane_cb(self, msg: TablePlane) -> None:
+        """Cache stable table metrics for the one-shot PICK pose log."""
+        with self.state_lock:
+            self.latest_table_plane = msg
+
     def _record_pose_sample(self, pose: PoseStamped) -> None:
         point = np.array([
             pose.pose.position.x,
@@ -464,9 +474,10 @@ class GraspControlNode(Node):
             self.interrupt_mode = None
             self.is_busy = True
             object_pose = copy.deepcopy(self.latest_object_base_pose)
+            table_plane = copy.deepcopy(self.latest_table_plane)
         threading.Thread(
             target=self._execute_candidate,
-            args=(desired_pose, object_pose),
+            args=(desired_pose, object_pose, table_plane),
             name='openmanipulator-execution',
             daemon=True,
         ).start()
@@ -579,12 +590,13 @@ class GraspControlNode(Node):
         self,
         desired_pose: PoseStamped,
         object_pose: Optional[PoseStamped] = None,
+        table_plane: Optional[TablePlane] = None,
     ) -> None:
         result_published = False
         command_pose = copy.deepcopy(desired_pose)
         orientation_residual = math.inf
         try:
-            self._log_object_pose_once(object_pose)
+            self._log_object_pose_once(object_pose, table_plane)
             candidates = self._vision_grasp_to_ee_candidates(
                 desired_pose.pose.orientation
             )
@@ -829,7 +841,9 @@ class GraspControlNode(Node):
         return roll, pitch, yaw
 
     def _log_object_pose_once(
-        self, object_pose: Optional[PoseStamped]
+        self,
+        object_pose: Optional[PoseStamped],
+        table_plane: Optional[TablePlane] = None,
     ) -> None:
         if object_pose is None:
             self.get_logger().warn(
@@ -840,6 +854,12 @@ class GraspControlNode(Node):
             object_pose.pose.orientation
         )
         position = object_pose.pose.position
+        table_text = 'table_height=unavailable, inlier_ratio=unavailable'
+        if table_plane is not None:
+            table_text = (
+                f'table_height={table_plane.height:+.4f} m, '
+                f'inlier_ratio={table_plane.inlier_ratio:.1%}'
+            )
         self.get_logger().info(
             '[PICK OBJECT 6D POSE] '
             f'frame={object_pose.header.frame_id}, '
@@ -847,7 +867,8 @@ class GraspControlNode(Node):
             f'z={position.z:.4f} m, '
             f'roll={math.degrees(roll):.2f} deg, '
             f'pitch={math.degrees(pitch):.2f} deg, '
-            f'yaw={math.degrees(yaw):.2f} deg'
+            f'yaw={math.degrees(yaw):.2f} deg, '
+            f'{table_text}'
         )
 
     @staticmethod

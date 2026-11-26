@@ -1,4 +1,5 @@
 import os
+import math
 import threading
 import time
 import traceback
@@ -8,10 +9,15 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+from rclpy.duration import Duration
+from rclpy.time import Time
 from sensor_msgs.msg import Image, CameraInfo, PointCloud2, PointField
 from std_msgs.msg import String, Header
+from geometry_msgs.msg import PoseStamped
 from cv_bridge import CvBridge
 import message_filters
+from tf2_geometry_msgs import do_transform_pose_stamped
+from tf2_ros import Buffer, TransformException, TransformListener
 from ultralytics import YOLO
 
 
@@ -22,6 +28,8 @@ class YoloSegPointCloudNode(Node):
         self.window_name = 'RealSense - YOLO Segmentation'
         self.display_frame = None
         self.display_lock = threading.Lock()
+        self.pose_overlay_lock = threading.Lock()
+        self.latest_base_object_pose = None
         self.display_stop = threading.Event()
         self.display_thread = threading.Thread(
             target=self.display_loop,
@@ -58,6 +66,7 @@ class YoloSegPointCloudNode(Node):
             'camera_optical_frame',
             'd435i_color_optical_frame'
         )
+        self.declare_parameter('base_frame', 'base_link')
         model_path = os.path.expanduser(
             str(self.get_parameter('model_path').value)
         )
@@ -68,6 +77,48 @@ class YoloSegPointCloudNode(Node):
         )
         self.camera_frame_id = str(
             self.get_parameter('camera_optical_frame').value
+        )
+        self.base_frame = str(self.get_parameter('base_frame').value)
+
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(
+            self.tf_buffer, self, spin_thread=False
+        )
+        self.create_subscription(
+            PoseStamped,
+            '/grasp/object_pose',
+            self.object_pose_cb,
+            10
+        )
+
+        # Table ROI is expressed as image fractions so it remains valid when
+        # the camera stream resolution changes.  The segmented object is
+        # dilated before exclusion to keep its depth discontinuity out of the
+        # plane fit.
+        self.declare_parameter('table_roi_u_min', 0.10)
+        self.declare_parameter('table_roi_u_max', 0.90)
+        self.declare_parameter('table_roi_v_min', 0.20)
+        self.declare_parameter('table_roi_v_max', 0.95)
+        self.declare_parameter('table_depth_min', 0.10)
+        self.declare_parameter('table_depth_max', 1.00)
+        self.declare_parameter('table_object_margin_px', 12)
+        self.declare_parameter('table_pixel_stride', 3)
+        self.table_roi = tuple(
+            float(self.get_parameter(name).value)
+            for name in (
+                'table_roi_u_min', 'table_roi_u_max',
+                'table_roi_v_min', 'table_roi_v_max'
+            )
+        )
+        self.table_depth_range = (
+            float(self.get_parameter('table_depth_min').value),
+            float(self.get_parameter('table_depth_max').value)
+        )
+        self.table_object_margin_px = int(
+            self.get_parameter('table_object_margin_px').value
+        )
+        self.table_pixel_stride = max(
+            1, int(self.get_parameter('table_pixel_stride').value)
         )
 
         # 1. OpenVINO FP16 모델 로드
@@ -110,6 +161,11 @@ class YoloSegPointCloudNode(Node):
         self.filtered_cloud_pub = self.create_publisher(
             PointCloud2,
             '/grasp/target_cloud_filtered',
+            10
+        )
+        self.table_cloud_pub = self.create_publisher(
+            PointCloud2,
+            '/grasp/table_cloud',
             10
         )
         self.cls_pub = self.create_publisher(String, '/grasp/target_class', 10)
@@ -190,6 +246,11 @@ class YoloSegPointCloudNode(Node):
             (0, 255, 0),
             2
         )
+        has_detection = res.masks is not None and len(res.boxes) > 0
+        if has_detection:
+            self.draw_pose_overlay(vis_img)
+        else:
+            self.clear_pose_overlay()
         vis_msg = self.create_bgr8_image(rgb_msg.header, vis_img)
         self.vis_pub.publish(vis_msg)
 
@@ -199,6 +260,13 @@ class YoloSegPointCloudNode(Node):
 
         # 검출이 사라지면 빈 메시지로 이전 RViz 점군을 즉시 제거한다.
         if self.intrinsics is None or res.masks is None or len(res.boxes) == 0:
+            if self.intrinsics is not None:
+                self.publish_table_cloud(
+                    rgb_msg.header,
+                    depth_img,
+                    color_img,
+                    np.zeros((h, w), dtype=bool)
+                )
             self.publish_empty_detection(rgb_msg.header, color_img)
             return
 
@@ -224,6 +292,13 @@ class YoloSegPointCloudNode(Node):
             rgb_msg.header.frame_id
             if rgb_msg.header.frame_id
             else self.camera_frame_id
+        )
+
+        self.publish_table_cloud(
+            cloud_header,
+            depth_img,
+            color_img,
+            mask
         )
 
         # Raw cloud: 세그멘테이션 마스크와 기본 Depth 범위만 적용
@@ -274,15 +349,167 @@ class YoloSegPointCloudNode(Node):
         cls_msg.data = cls_name
         self.cls_pub.publish(cls_msg)
 
+    def object_pose_cb(self, msg: PoseStamped):
+        """Cache the object pose transformed to base_link for screen overlay."""
+        if not msg.header.frame_id:
+            return
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.base_frame,
+                msg.header.frame_id,
+                Time.from_msg(msg.header.stamp),
+                timeout=Duration(seconds=0.05)
+            )
+            base_pose = do_transform_pose_stamped(msg, transform)
+            base_pose.header.frame_id = self.base_frame
+            with self.pose_overlay_lock:
+                self.latest_base_object_pose = base_pose
+        except TransformException:
+            # The camera image remains usable while the robot TF catches up.
+            return
+
+    def clear_pose_overlay(self):
+        """Discard a stale pose as soon as segmentation disappears."""
+        with self.pose_overlay_lock:
+            self.latest_base_object_pose = None
+
+    @staticmethod
+    def quaternion_to_rpy(quaternion):
+        """Convert a geometry quaternion to roll, pitch and yaw radians."""
+        values = np.asarray([
+            quaternion.x,
+            quaternion.y,
+            quaternion.z,
+            quaternion.w,
+        ], dtype=np.float64)
+        norm = float(np.linalg.norm(values))
+        if norm < 1e-9:
+            return None
+        x, y, z, w = values / norm
+        roll = math.atan2(
+            2.0 * (w * x + y * z),
+            1.0 - 2.0 * (x * x + y * y)
+        )
+        pitch = math.asin(max(
+            -1.0,
+            min(1.0, 2.0 * (w * y - z * x))
+        ))
+        yaw = math.atan2(
+            2.0 * (w * z + x * y),
+            1.0 - 2.0 * (y * y + z * z)
+        )
+        return roll, pitch, yaw
+
+    def draw_pose_overlay(self, image: np.ndarray):
+        """Draw the latest base-frame object 6D pose on the YOLO image."""
+        with self.pose_overlay_lock:
+            pose = self.latest_base_object_pose
+
+        lines = [f'6D POSE ({self.base_frame})']
+        if pose is None:
+            lines.append('waiting for pose / TF...')
+        else:
+            rpy = self.quaternion_to_rpy(pose.pose.orientation)
+            if rpy is None:
+                lines.append('invalid orientation')
+            else:
+                position = pose.pose.position
+                roll, pitch, yaw = (math.degrees(value) for value in rpy)
+                lines.extend([
+                    f'XYZ [m]  {position.x:+.4f}  '
+                    f'{position.y:+.4f}  {position.z:+.4f}',
+                    f'RPY [deg] {roll:+.2f}  {pitch:+.2f}  {yaw:+.2f}',
+                ])
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.55
+        thickness = 1
+        line_height = 25
+        left, top = 12, 50
+        max_width = max(
+            cv2.getTextSize(line, font, font_scale, thickness)[0][0]
+            for line in lines
+        )
+        bottom = top + line_height * len(lines) + 8
+        right = min(image.shape[1] - 1, left + max_width + 16)
+        overlay = image.copy()
+        cv2.rectangle(overlay, (left, top), (right, bottom), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.60, image, 0.40, 0.0, image)
+
+        for index, line in enumerate(lines):
+            color = (0, 255, 255) if index == 0 else (255, 255, 255)
+            cv2.putText(
+                image,
+                line,
+                (left + 8, top + 20 + line_height * index),
+                font,
+                font_scale,
+                color,
+                thickness,
+                cv2.LINE_AA
+            )
+
+    def publish_table_cloud(
+        self,
+        header: Header,
+        depth_img: np.ndarray,
+        color_img: np.ndarray,
+        object_mask: np.ndarray
+    ):
+        """Publish work-ROI points after excluding the detected object."""
+        cloud_header = Header()
+        cloud_header.stamp = header.stamp
+        cloud_header.frame_id = (
+            header.frame_id if header.frame_id else self.camera_frame_id
+        )
+        height, width = depth_img.shape[:2]
+        u_min, u_max, v_min, v_max = self.table_roi
+        left = int(np.clip(round(u_min * width), 0, width))
+        right = int(np.clip(round(u_max * width), 0, width))
+        top = int(np.clip(round(v_min * height), 0, height))
+        bottom = int(np.clip(round(v_max * height), 0, height))
+
+        table_mask = np.zeros((height, width), dtype=np.uint8)
+        if right > left and bottom > top:
+            table_mask[top:bottom:self.table_pixel_stride,
+                       left:right:self.table_pixel_stride] = 1
+
+        if np.any(object_mask):
+            margin = max(0, self.table_object_margin_px)
+            if margin > 0:
+                size = 2 * margin + 1
+                kernel = np.ones((size, size), dtype=np.uint8)
+                excluded = cv2.dilate(
+                    object_mask.astype(np.uint8), kernel, iterations=1
+                ) > 0
+            else:
+                excluded = object_mask
+            table_mask[excluded] = 0
+
+        points, colors, _, _, _ = self.mask_to_points(
+            table_mask > 0,
+            depth_img,
+            color_img,
+            depth_range=self.table_depth_range
+        )
+        self.table_cloud_pub.publish(
+            self.create_colored_pointcloud2(cloud_header, points, colors)
+        )
+
     def mask_to_points(
         self,
         mask: np.ndarray,
         depth_img: np.ndarray,
-        color_img: np.ndarray
+        color_img: np.ndarray,
+        depth_range=(0.10, 1.50)
     ):
         v_idx, u_idx = np.where(mask)
         z_mm = depth_img[v_idx, u_idx].astype(np.float32)
-        valid = (z_mm > 100.0) & (z_mm < 1500.0)
+        min_depth, max_depth = depth_range
+        valid = (
+            (z_mm > min_depth * 1000.0)
+            & (z_mm < max_depth * 1000.0)
+        )
 
         u_valid = u_idx[valid]
         v_valid = v_idx[valid]

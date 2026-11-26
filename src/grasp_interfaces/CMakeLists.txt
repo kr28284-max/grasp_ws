@@ -9,6 +9,7 @@ find_package(std_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/GraspCandidate.msg"
   "msg/GraspExecutionResult.msg"
+  "msg/TablePlane.msg"
   DEPENDENCIES geometry_msgs std_msgs
 )
 

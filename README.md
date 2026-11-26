@@ -122,6 +122,40 @@ Immediately before evaluating the selected PICK request, the controller prints
 the corresponding vision object pose once as base-frame XYZ and roll/pitch/yaw.
 It does not continuously print the vision pose stream.
 
+## Table-plane and camera-TF verification
+
+The vision launch also publishes a depth ROI with the segmented object and its
+boundary margin removed. A separate node fits this cloud in `base_link`, waits
+for a stable multi-frame result, and then publishes:
+
+```text
+/grasp/table_cloud          sensor_msgs/msg/PointCloud2
+/grasp/table_normal         geometry_msgs/msg/Vector3Stamped
+/grasp/table_plane          grasp_interfaces/msg/TablePlane
+/grasp/table_plane_marker   visualization_msgs/msg/MarkerArray
+base_link -> table_frame    dynamic TF
+```
+
+The YOLO bounding-box camera view and `/grasp/debug_image` include the latest
+object XYZ and roll/pitch/yaw transformed to `base_link`. The overlay is
+cleared when segmentation disappears.
+
+The table estimator does not print a periodic terminal stream. Its stable
+height and inlier ratio are appended once to the existing `[PICK OBJECT 6D
+POSE]` output immediately before PICK evaluation. Before changing object-pose
+math, verify at several arm recognition poses that:
+
+- table roll and pitch stay close to zero;
+- table height stays close to the physical `base_link` table height (normally
+  `z=0` for the current setup);
+- the RViz table ROI, translucent plane, normal arrow, and `table_frame` remain
+  coincident with the physical support surface.
+
+If the base-frame plane changes with arm pose, calibrate the camera mount TF
+first. Do not compensate for that error in the object pose. The image ROI,
+depth range, object exclusion margin, RANSAC tolerance, and stability limits
+are configurable in `src/grasp_vision/config/grasp_vision.yaml`.
+
 The dummy adapter is intentionally not a success simulation. It prints the
 received frame, XYZ, and quaternion and reports `executed=false`, making it
 safe to replace later with an RB3-730 MoveIt simulation adapter.

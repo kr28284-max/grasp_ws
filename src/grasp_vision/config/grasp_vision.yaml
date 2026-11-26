@@ -5,6 +5,29 @@ yolo_seg_node:
     depth_topic: /realsense/d435i/aligned_depth_to_color/image_raw
     camera_info_topic: /realsense/d435i/color/camera_info
     camera_optical_frame: d435i_color_optical_frame
+    base_frame: base_link
+    table_roi_u_min: 0.10
+    table_roi_u_max: 0.90
+    table_roi_v_min: 0.20
+    table_roi_v_max: 0.95
+    table_depth_min: 0.10
+    table_depth_max: 1.00
+    table_object_margin_px: 12
+    table_pixel_stride: 3
+
+table_plane_node:
+  ros__parameters:
+    base_frame: base_link
+    table_frame: table_frame
+    min_points: 100
+    ransac_iterations: 150
+    distance_threshold: 0.004
+    min_inlier_ratio: 0.45
+    stability_window: 8
+    min_stable_samples: 5
+    max_normal_deviation_deg: 3.0
+    max_height_std: 0.008
+    marker_size: 0.40
 
 pose_estimation_node:
   ros__parameters:

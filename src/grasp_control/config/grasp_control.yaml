@@ -19,7 +19,7 @@ grasp_control_node:
 
     # The PCA grasp point differs from EATED's bounding-box center, so the old
     # +2 cm X calibration is intentionally not copied.
-    pick_calibration_xyz_m: [0.0, 0.0, 0.0]
+    pick_calibration_xyz_m: [0.02, 0.0, 0.045]
     pregrasp_offset_xyz_m: [0.0, 0.0, 0.05]
     retreat_offset_z_m: 0.15
     pick_orientation_xyzw: [0.0, 0.7071068, 0.0, 0.7071068]
@@ -42,10 +42,10 @@ grasp_control_node:
     max_position_stddev_m: 0.005
 
     # Conservative initial limits; verify against the real table and mount.
-    workspace_min_xyz_m: [0.05, -0.30, 0.01]
+    workspace_min_xyz_m: [0.05, -0.30, 0.00]
     workspace_max_xyz_m: [0.45, 0.30, 0.45]
     return_home_on_error: true
-    max_orientation_residual_deg: 20.0
+    max_orientation_residual_deg: 30.0
 
 grasp_router_node:
   ros__parameters:

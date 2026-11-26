@@ -26,11 +26,11 @@ def generate_launch_description():
             default_value='true',
             description='Publish end_effector_link to d435i_link static TF',
         ),
-        DeclareLaunchArgument('camera_mount_x', default_value='-0.065'),
+        DeclareLaunchArgument('camera_mount_x', default_value='-0.035'),
         DeclareLaunchArgument('camera_mount_y', default_value='0.0195'),
-        DeclareLaunchArgument('camera_mount_z', default_value='0.052'),
+        DeclareLaunchArgument('camera_mount_z', default_value='0.048'),   #0.052
         DeclareLaunchArgument('camera_mount_roll', default_value='0.0'),
-        DeclareLaunchArgument('camera_mount_pitch', default_value='0.0'),
+        DeclareLaunchArgument('camera_mount_pitch', default_value='0.105'),
         DeclareLaunchArgument('camera_mount_yaw', default_value='0.0'),
     ]
 
@@ -89,6 +89,13 @@ def generate_launch_description():
         output='screen',
         parameters=[config_path],
     )
+    table_plane_node = Node(
+        package='grasp_vision',
+        executable='table_plane_node',
+        name='table_plane_node',
+        output='screen',
+        parameters=[config_path],
+    )
     rviz = Node(
         package='rviz2',
         executable='rviz2',
@@ -101,5 +108,12 @@ def generate_launch_description():
     )
     return LaunchDescription(
         arguments
-        + [realsense_launch, camera_mount_tf, yolo_node, pose_node, rviz]
+        + [
+            realsense_launch,
+            camera_mount_tf,
+            yolo_node,
+            table_plane_node,
+            pose_node,
+            rviz,
+        ]
     )

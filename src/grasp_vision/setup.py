@@ -31,6 +31,7 @@ setup(
     entry_points={
         'console_scripts': [
             'yolo_seg_node = grasp_vision.yolo_seg_node:main',
+            'table_plane_node = grasp_vision.table_plane_node:main',
             'pose_estimation_node = grasp_vision.pose_estimation_node:main',
         ],
     },
